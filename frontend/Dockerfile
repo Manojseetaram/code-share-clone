@@ -1,27 +1,21 @@
-# Build stage
-FROM node:20-alpine as builder
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
 WORKDIR /app
-ARG VITE_WS_URL=wss://yourdomain.com
-ENV VITE_WS_URL=$VITE_WS_URL
+
 COPY package*.json ./
 RUN npm install
+
 COPY . .
 RUN npm run build
 
-# Serve with nginx
+# ── Serve with nginx ───────────────────────────────────────────────────────────
 FROM nginx:alpine
+
 COPY --from=builder /app/dist /usr/share/nginx/html
-# SPA fallback — all routes go to index.html
-RUN echo 'server { \
-  listen 80; \
-  root /usr/share/nginx/html; \
-  location / { try_files $uri $uri/ /index.html; } \
-  location /api { proxy_pass http://backend:3001; } \
-  location /ws { \
-    proxy_pass http://backend:3001; \
-    proxy_http_version 1.1; \
-    proxy_set_header Upgrade $http_upgrade; \
-    proxy_set_header Connection "Upgrade"; \
-  } \
-}' > /etc/nginx/conf.d/default.conf
+
+# SPA fallback + reverse-proxy to backend container
+# NOTE: no VITE_WS_URL needed — the browser connects to the same host/port
+# and nginx proxies /api and /ws to the backend service.
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
 EXPOSE 80
