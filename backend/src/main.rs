@@ -84,7 +84,8 @@ pub struct SlugCheck {
     pub available: bool,
     pub slug: String,
 }
-
+mod error;
+mod db;
 // All WebSocket messages - serialized with snake_case type tag
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -139,8 +140,15 @@ fn validate(slug: &str) -> Result<(), AppError> {
     }
     Ok(())
 }
+fn gen_slug() -> String {
+    const ALPHABET: &[char] = &[
+        'a','b','c','d','e','f','g','h','i','j','k','l','m',
+        'n','o','p','q','r','s','t','u','v','w','x','y','z',
+        '0','1','2','3','4','5','6','7','8','9',
+    ];
 
-fn gen_slug() -> String { nanoid::nanoid!(8, &nanoid::alphabet::SAFE) }
+    nanoid::nanoid!(8, ALPHABET)
+}
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true }))
