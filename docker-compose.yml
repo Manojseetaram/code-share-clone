@@ -7,25 +7,46 @@ services:
       dockerfile: Dockerfile
     restart: always
     environment:
-      DATABASE_URL: sqlite:///data/codeshare.db
+      # Postgres — matches the db service defined below
+      DATABASE_URL: postgres://codeshare:codeshare@db:5432/codeshare
       PORT: 3001
       FRONTEND_URL: https://yourdomain.com   # ← change this
-    volumes:
-      - db_data:/data
-    ports:
-      - "3001:3001"
+      CLOUDINARY_CLOUD_NAME: your_cloud_name  # ← change this
+      CLOUDINARY_UPLOAD_PRESET: your_preset   # ← change this
+    depends_on:
+      db:
+        condition: service_healthy
+    # Don't expose 3001 publicly — nginx proxies to it internally
+    expose:
+      - "3001"
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      args:
-        VITE_WS_URL: wss://yourdomain.com   # ← change this
     restart: always
     ports:
       - "80:80"
     depends_on:
       - backend
+
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: codeshare
+      POSTGRES_PASSWORD: codeshare
+      POSTGRES_DB: codeshare
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    # Only expose internally; remove the ports block for production
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codeshare"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   db_data:

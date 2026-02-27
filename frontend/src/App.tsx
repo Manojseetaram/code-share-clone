@@ -8,7 +8,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 const BACKEND    = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? ''
 const WS_BACKEND = BACKEND
   ? BACKEND.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
-  : 'ws://localhost:3003'
+  : 'ws://localhost:3004'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface PastedImage { id: string; url: string; width: number; height: number }
