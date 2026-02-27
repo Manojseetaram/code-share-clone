@@ -1,16 +1,14 @@
-
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import './index.css'
 import App from './App'
 
+// NO StrictMode — it double-mounts components which breaks Monaco paste listener
 createRoot(document.getElementById('root')!).render(
-
-    <BrowserRouter>
-      <Routes>
-        <Route path="/"      element={<App />} />
-        <Route path="/:slug" element={<App />} />
-      </Routes>
-    </BrowserRouter>
-
+  <BrowserRouter>
+    <Routes>
+      <Route path="/"      element={<App />} />
+      <Route path="/:slug" element={<App />} />
+    </Routes>
+  </BrowserRouter>
 )
