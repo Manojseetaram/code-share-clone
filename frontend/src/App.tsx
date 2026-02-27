@@ -2,67 +2,107 @@ import './App.css'
 import { useState, useRef, useCallback, useEffect } from 'react'
 import Editor from '@monaco-editor/react'
 import type * as Monaco from 'monaco-editor'
+import { useParams, useNavigate } from 'react-router-dom'
 
-const API = 'http://localhost:3001'
+const API = ''
+const WS_BASE = import.meta.env.VITE_WS_URL ?? 'ws://localhost:3001'
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────
 
-interface PastedImage {
-  id: string
-  dataUrl: string
-  width: number
-  height: number
+interface PastedImage { id: string; dataUrl: string; width: number; height: number }
+
+// ─── useWebSocket hook ────────────────────────────────────────────────────
+
+function useWebSocket(
+  slug: string | undefined,
+  onEdit: (content: string, language: string) => void,
+  onImage: (img: PastedImage) => void,
+  onRemoveImage: (id: string) => void,
+  onViewers: (n: number) => void,
+) {
+  const wsRef = useRef<WebSocket | null>(null)
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const isMounted = useRef(true)
+
+  const connect = useCallback(() => {
+    if (!slug || !isMounted.current) return
+    const ws = new WebSocket(`${WS_BASE}/ws/${slug}`)
+    wsRef.current = ws
+
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data)
+        if (msg.type === 'broadcast_edit')        onEdit(msg.content, msg.language)
+        else if (msg.type === 'broadcast_image')  onImage(msg.image)
+        else if (msg.type === 'broadcast_remove_image') onRemoveImage(msg.id)
+        else if (msg.type === 'viewers')          onViewers(msg.count)
+        else if (msg.type === 'connected')        onViewers(msg.viewers)
+      } catch {}
+    }
+
+    ws.onclose = () => {
+      if (!isMounted.current) return
+      reconnectTimer.current = setTimeout(connect, 3000)
+    }
+  }, [slug])
+
+  useEffect(() => {
+    isMounted.current = true
+    connect()
+    return () => {
+      isMounted.current = false
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+      wsRef.current?.close()
+    }
+  }, [connect])
+
+  const send = useCallback((msg: object) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(msg))
+    }
+  }, [])
+
+  return { send }
 }
 
-interface SnippetResponse {
-  slug: string
-  content: string
-  language: string
-  images: PastedImage[]
-  expires_at: string
-  url: string
-}
-
-
+// ─── Share Modal ──────────────────────────────────────────────────────────
 
 function ShareModal({
-  onClose,
-  theme,
-  code,
-  language,
-  images,
+  onClose, theme, code, language, images, currentSlug,
 }: {
   onClose: () => void
   theme: 'dark' | 'light'
   code: string
   language: string
   images: PastedImage[]
+  currentSlug?: string
 }) {
   const isDark = theme === 'dark'
-  const [slug, setSlug] = useState('')
-  const [slugStatus, setSlugStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle')
-  const [sharedUrl, setSharedUrl] = useState('')
+  const navigate = useNavigate()
+  const [customSlug, setCustomSlug] = useState(currentSlug ?? '')
+  const [slugStatus, setSlugStatus] = useState<'idle' | 'checking' | 'available' | 'taken'>('idle')
+  const [sharedUrl, setSharedUrl] = useState(currentSlug ? `${window.location.origin}/${currentSlug}` : '')
   const [copied, setCopied] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const checkTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Real-time slug availability check
-  const checkSlug = useCallback(async (value: string) => {
-    if (!value.trim()) { setSlugStatus('idle'); return }
+  const checkSlug = useCallback(async (v: string) => {
+    if (!v.trim()) { setSlugStatus('idle'); return }
+    // Don't check if it's the current slug (already "owned")
+    if (v === currentSlug) { setSlugStatus('available'); return }
     setSlugStatus('checking')
     try {
-      const res = await fetch(`${API}/api/check/${encodeURIComponent(value)}`)
+      const res = await fetch(`${API}/api/check/${encodeURIComponent(v)}`)
       const data = await res.json()
       setSlugStatus(data.available ? 'available' : 'taken')
-    } catch {
-      setSlugStatus('idle')
-    }
-  }, [])
+    } catch { setSlugStatus('idle') }
+  }, [currentSlug])
 
   const handleSlugChange = (v: string) => {
-    setSlug(v)
+    setCustomSlug(v)
     setSharedUrl('')
+    setError('')
     if (checkTimer.current) clearTimeout(checkTimer.current)
     if (!v.trim()) { setSlugStatus('idle'); return }
     setSlugStatus('checking')
@@ -77,122 +117,85 @@ function ShareModal({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          slug: slug.trim() || undefined,
+          slug: customSlug.trim() || undefined,
           content: code,
           language,
           images: images.length > 0 ? images : undefined,
         }),
       })
       const data = await res.json()
-      if (!res.ok) {
-        setError(data.error || 'Something went wrong')
-        return
-      }
-      const full = `${window.location.origin}/${data.slug}`
-      setSharedUrl(full)
-      // Update browser URL without reload
-      window.history.pushState({}, '', `/${data.slug}`)
-    } catch {
-      setError('Could not connect to server')
-    } finally {
-      setLoading(false)
-    }
+      if (!res.ok) { setError(data.error || 'Something went wrong'); return }
+      const url = `${window.location.origin}/${data.slug}`
+      setSharedUrl(url)
+      navigate(`/${data.slug}`)
+    } catch { setError('Could not connect to server') }
+    finally { setLoading(false) }
   }
 
-  const copy = () => {
-    navigator.clipboard.writeText(sharedUrl)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
-
-  const slugIndicator = () => {
-    if (slugStatus === 'checking') return <span className="text-yellow-400">checking...</span>
-    if (slugStatus === 'available') return <span className="text-green-400">✓ available</span>
-    if (slugStatus === 'taken') return <span className="text-red-400">✗ taken</span>
+  const slugBadge = () => {
+    if (slugStatus === 'checking')  return <span className="text-yellow-400 text-[11px]">checking…</span>
+    if (slugStatus === 'available') return <span className="text-green-400 text-[11px]">✓ available</span>
+    if (slugStatus === 'taken')     return <span className="text-red-400 text-[11px]">✗ taken</span>
     return null
   }
 
+  const inputCls = isDark
+    ? 'bg-[#2d2d2d] border-[#555] text-gray-200 focus:border-blue-500'
+    : 'bg-gray-50 border-gray-300 text-gray-800 focus:border-blue-500'
+
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-      onClick={e => e.target === e.currentTarget && onClose()}
-    >
-      <div className={`w-[440px] mx-4 rounded-lg shadow-2xl border ${
-        isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'
-      }`}>
-        {/* Header */}
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className={`w-[440px] mx-4 rounded-lg shadow-2xl border ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'}`}>
+
         <div className={`flex items-center justify-between px-5 py-4 border-b ${isDark ? 'border-[#3c3c3c]' : 'border-gray-100'}`}>
-          <span className={`font-semibold ${isDark ? 'text-white' : 'text-gray-900'}`}>Share Snippet</span>
+          <span className={`font-semibold text-sm ${isDark ? 'text-white' : 'text-gray-900'}`}>Share Snippet</span>
           <button onClick={onClose} className={`text-xl leading-none ${isDark ? 'text-gray-400 hover:text-white' : 'text-gray-400 hover:text-gray-700'}`}>×</button>
         </div>
 
         <div className="px-5 py-5 flex flex-col gap-4">
-          {/* Custom URL input */}
           {!sharedUrl && (
             <div>
               <div className="flex items-center justify-between mb-2">
                 <label className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                  Custom URL <span className={`text-[10px] ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>(optional)</span>
+                  Custom URL <span className="opacity-50">(optional)</span>
                 </label>
-                <span className="text-[11px]">{slugIndicator()}</span>
+                {slugBadge()}
               </div>
-              <input
-                value={slug}
-                onChange={e => handleSlugChange(e.target.value)}
+              <input value={customSlug} onChange={e => handleSlugChange(e.target.value)}
                 placeholder="leave blank for auto-generated"
-                className={`w-full px-3 py-2 rounded border text-sm font-mono outline-none ${
-                  isDark
-                    ? 'bg-[#2d2d2d] border-[#555] text-gray-200 focus:border-blue-500'
-                    : 'bg-gray-50 border-gray-300 text-gray-800 focus:border-blue-500'
-                }`}
+                className={`w-full px-3 py-2 rounded border text-sm font-mono outline-none ${inputCls}`}
               />
-              {slug && (
+              {customSlug && (
                 <p className={`mt-1.5 text-[11px] font-mono ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                  {window.location.host}/<span className={isDark ? 'text-blue-400' : 'text-blue-600'}>
-                    {slug.toLowerCase().replace(/[^a-z0-9-]/g, '-')}
+                  {window.location.host}/
+                  <span className={isDark ? 'text-blue-400' : 'text-blue-600'}>
+                    {customSlug.toLowerCase().replace(/[^a-z0-9-]/g, '-')}
                   </span>
                 </p>
               )}
             </div>
           )}
 
-          {/* Error */}
-          {error && (
-            <p className="text-xs text-red-400 bg-red-400/10 px-3 py-2 rounded border border-red-400/20">{error}</p>
-          )}
+          {error && <p className="text-xs text-red-400 bg-red-400/10 px-3 py-2 rounded border border-red-400/20">{error}</p>}
 
-          {/* Shared result */}
           {sharedUrl ? (
             <div className="flex flex-col gap-3">
-              <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                ✅ Snippet shared! Link is valid for <strong>24 hours</strong>.
-              </p>
-              <div className={`flex items-center gap-2 p-3 rounded border font-mono text-xs ${
-                isDark ? 'bg-[#2d2d2d] border-[#444] text-gray-300' : 'bg-gray-50 border-gray-200 text-gray-700'
-              }`}>
+              <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>✅ Shared! Valid for <strong>24 hours</strong>.</p>
+              <div className={`flex items-center gap-2 p-3 rounded border font-mono text-xs ${isDark ? 'bg-[#2d2d2d] border-[#444] text-gray-300' : 'bg-gray-50 border-gray-200 text-gray-700'}`}>
                 <span className="flex-1 truncate">{sharedUrl}</span>
-                <button
-                  onClick={copy}
-                  className={`shrink-0 px-2 py-1 rounded text-xs transition-colors ${
-                    copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'
-                  }`}
-                >
+                <button onClick={() => { navigator.clipboard.writeText(sharedUrl); setCopied(true); setTimeout(() => setCopied(false), 2000) }}
+                  className={`shrink-0 px-2 py-1 rounded text-xs transition-colors ${copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}>
                   {copied ? '✓' : 'Copy'}
                 </button>
               </div>
-              <button onClick={onClose} className={`text-sm py-2 rounded border transition-colors ${
-                isDark ? 'border-[#555] text-gray-300 hover:bg-[#2d2d2d]' : 'border-gray-300 text-gray-600 hover:bg-gray-50'
-              }`}>
-                Close
-              </button>
+              <button onClick={onClose} className={`text-sm py-2 rounded border ${isDark ? 'border-[#555] text-gray-300 hover:bg-[#2d2d2d]' : 'border-gray-300 text-gray-600 hover:bg-gray-50'}`}>Close</button>
             </div>
           ) : (
-            <button
-              onClick={handleShare}
+            <button onClick={handleShare}
               disabled={loading || slugStatus === 'taken' || slugStatus === 'checking'}
-              className="w-full py-2.5 rounded text-sm font-medium transition-colors bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {loading ? 'Sharing...' : 'Share'}
+              className="w-full py-2.5 rounded text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+              {loading ? 'Sharing…' : 'Share'}
             </button>
           )}
         </div>
@@ -201,46 +204,96 @@ function ShareModal({
   )
 }
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
+// ─── Main App ─────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [theme, setTheme] = useState<'dark' | 'light'>('dark')
-  const [shareOpen, setShareOpen] = useState(false)
+  const { slug }  = useParams<{ slug?: string }>()
+  const navigate  = useNavigate()
+
+  const [theme, setTheme]               = useState<'dark' | 'light'>('dark')
+  const [shareOpen, setShareOpen]       = useState(false)
   const [pastedImages, setPastedImages] = useState<PastedImage[]>([])
-  const [code, setCode] = useState(`// Start typing or paste your code here...\n\n`)
-  const [language, setLanguage] = useState('javascript')
-  const [loadError, setLoadError] = useState('')
-  const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
-  const monacoRef = useRef<typeof Monaco | null>(null)
-  const isDark = theme === 'dark'
+  const [code, setCode]                 = useState('// Start typing or paste your code here...\n\n')
+  const [language, setLanguage]         = useState('javascript')
+  const [loadError, setLoadError]       = useState('')
+  const [viewers, setViewers]           = useState(1)
 
-  // ── Load snippet from URL on mount ──
-  useEffect(() => {
-    const slug = window.location.pathname.replace(/^\//, '')
-    if (!slug || slug === '') return
+  const editorRef  = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
+  const monacoRef  = useRef<typeof Monaco | null>(null)
+  const isRemote   = useRef(false)   // flag: ignore onChange when applying remote edit
+  const sendTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const isDark     = theme === 'dark'
 
-    fetch(`${API}/api/snippets/${encodeURIComponent(slug)}`)
-      .then(res => {
-        if (!res.ok) throw new Error('not found')
-        return res.json() as Promise<SnippetResponse>
-      })
-      .then(data => {
-        setCode(data.content)
-        setLanguage(data.language)
-        if (data.images?.length) setPastedImages(data.images)
-      })
-      .catch(() => {
-        setLoadError('Snippet not found or has expired.')
-      })
+  // ── WebSocket callbacks (stable refs to avoid reconnect) ──────────────
+  const onRemoteEdit = useCallback((content: string, lang: string) => {
+    isRemote.current = true
+    setCode(content)
+    setLanguage(lang)
+    setTimeout(() => { isRemote.current = false }, 50)
   }, [])
 
-  // ── Handle image paste ──
-  const handlePaste = useCallback((e: ClipboardEvent) => {
-    const items = e.clipboardData?.items
-    if (!items) return
-    for (const item of Array.from(items)) {
-      if (item.type.startsWith('image/')) {
-        e.preventDefault()
+  const onRemoteImage = useCallback((img: PastedImage) => {
+    setPastedImages(prev => prev.find(i => i.id === img.id) ? prev : [...prev, img])
+  }, [])
+
+  const onRemoteRemove = useCallback((id: string) => {
+    setPastedImages(prev => prev.filter(i => i.id !== id))
+  }, [])
+
+  const { send } = useWebSocket(slug, onRemoteEdit, onRemoteImage, onRemoteRemove, setViewers)
+
+  // ── Load snippet on mount / slug change ───────────────────────────────
+  useEffect(() => {
+    if (!slug) return
+    setLoadError('')
+    fetch(`${API}/api/snippets/${encodeURIComponent(slug)}`)
+      .then(r => { if (!r.ok) throw new Error(); return r.json() })
+      .then(d => {
+        isRemote.current = true
+        setCode(d.content)
+        setLanguage(d.language)
+        if (d.images?.length) setPastedImages(d.images)
+        setTimeout(() => { isRemote.current = false }, 50)
+      })
+      .catch(() => setLoadError('Snippet not found or has expired.'))
+  }, [slug])
+
+  // ── Send edit over WS (debounced 300ms) ───────────────────────────────
+  const handleCodeChange = useCallback((val: string | undefined) => {
+    if (isRemote.current) return
+    const v = val ?? ''
+    setCode(v)
+    if (sendTimer.current) clearTimeout(sendTimer.current)
+    sendTimer.current = setTimeout(() => {
+      send({ type: 'edit', content: v, language })
+    }, 300)
+  }, [send, language])
+
+  // ── Monaco mount: attach paste to editor DOM ──────────────────────────
+  const handleEditorMount = useCallback((
+    editor: Monaco.editor.IStandaloneCodeEditor,
+    monaco: typeof Monaco,
+  ) => {
+    editorRef.current  = editor
+    monacoRef.current  = monaco
+
+    // ← THIS is the key fix for image paste
+    // We need to listen on the textarea inside Monaco, not the outer div
+    const textarea = editor.getDomNode()?.querySelector('textarea')
+    const target   = textarea ?? editor.getDomNode()
+    if (!target) return
+
+    target.addEventListener('paste', (e: Event) => {
+      const clip  = e as ClipboardEvent
+      const items = Array.from(clip.clipboardData?.items ?? [])
+      const hasImage = items.some(i => i.type.startsWith('image/'))
+      if (!hasImage) return
+
+      clip.stopPropagation()
+      clip.preventDefault()
+
+      for (const item of items) {
+        if (!item.type.startsWith('image/')) continue
         const file = item.getAsFile()
         if (!file) continue
         const reader = new FileReader()
@@ -249,69 +302,57 @@ export default function App() {
           const img = new Image()
           img.onload = () => {
             const newImg: PastedImage = {
-              id: crypto.randomUUID(),
+              id:     crypto.randomUUID(),
               dataUrl,
-              width: img.naturalWidth,
+              width:  img.naturalWidth,
               height: img.naturalHeight,
             }
             setPastedImages(prev => [...prev, newImg])
-            const editor = editorRef.current
-            const monaco = monacoRef.current
-            if (editor && monaco) {
-              const pos = editor.getPosition()
-              if (pos) {
-                const range = new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column)
-                editor.executeEdits('paste-image', [{
-                  range,
-                  text: `# [image ${img.naturalWidth}×${img.naturalHeight}]\n`,
-                }])
-              }
+            send({ type: 'image', image: newImg })
+
+            // Insert marker at cursor
+            const pos = editor.getPosition()
+            if (pos) {
+              editor.executeEdits('paste-image', [{
+                range: new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column),
+                text: `# [image: ${img.naturalWidth}×${img.naturalHeight}]\n`,
+              }])
+              editor.focus()
             }
           }
           img.src = dataUrl
         }
         reader.readAsDataURL(file)
       }
-    }
-  }, [])
+    }, true) // useCapture=true to intercept before Monaco
+  }, [send])
 
-  useEffect(() => {
-    document.addEventListener('paste', handlePaste)
-    return () => document.removeEventListener('paste', handlePaste)
-  }, [handlePaste])
-
-  const handleEditorMount = (
-    editor: Monaco.editor.IStandaloneCodeEditor,
-    monaco: typeof Monaco
-  ) => {
-    editorRef.current = editor
-    monacoRef.current = monaco
-  }
+  const removeImage = useCallback((id: string) => {
+    setPastedImages(p => p.filter(i => i.id !== id))
+    send({ type: 'remove_image', id })
+  }, [send])
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}
-      className={isDark ? 'bg-[#1e1e1e]' : 'bg-white'}
-    >
+      className={isDark ? 'bg-[#1e1e1e]' : 'bg-white'}>
+
       {/* ── Navbar ── */}
-      <nav className={`flex items-center justify-between px-5 h-12 shrink-0 border-b ${
-        isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'
-      }`}>
+      <nav className={`flex items-center justify-between px-5 h-12 shrink-0 border-b ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'}`}>
         <a href="/" className={`text-base font-bold tracking-tight no-underline ${isDark ? 'text-white' : 'text-gray-900'}`}>
           <span className={isDark ? 'text-blue-400' : 'text-blue-600'}>×</span>codeshare
         </a>
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
-            className={`w-8 h-8 rounded flex items-center justify-center text-sm transition-colors ${
-              isDark ? 'hover:bg-[#2d2d2d] text-gray-400' : 'hover:bg-gray-100 text-gray-500'
-            }`}
-          >
+          {slug && viewers > 1 && (
+            <span className={`text-xs px-2 py-1 rounded-full ${isDark ? 'bg-[#2d2d2d] text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
+              👁 {viewers} viewing
+            </span>
+          )}
+          <button onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+            className={`w-8 h-8 rounded flex items-center justify-center text-sm transition-colors ${isDark ? 'hover:bg-[#2d2d2d] text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}>
             {isDark ? '☀' : '🌙'}
           </button>
-          <button
-            onClick={() => setShareOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
-          >
+          <button onClick={() => setShareOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors">
             <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
             </svg>
@@ -320,25 +361,22 @@ export default function App() {
         </div>
       </nav>
 
-      {/* ── Error banner ── */}
       {loadError && (
-        <div className="bg-red-900/40 border-b border-red-800 text-red-300 text-xs px-5 py-2">
-          {loadError}
-        </div>
+        <div className="bg-red-900/40 border-b border-red-800 text-red-300 text-xs px-5 py-2">{loadError}</div>
       )}
 
-      {/* ── Monaco Editor ── */}
+      {/* ── Monaco ── */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
         <Editor
           height="100%"
           language={language}
           value={code}
           theme={isDark ? 'vs-dark' : 'vs'}
-          onChange={v => setCode(v ?? '')}
+          onChange={handleCodeChange}
           onMount={handleEditorMount}
           options={{
             fontSize: 14,
-            fontFamily: "'Fira Code', 'Cascadia Code', Consolas, 'Courier New', monospace",
+            fontFamily: "'Fira Code', 'Cascadia Code', Consolas, monospace",
             fontLigatures: true,
             lineNumbers: 'on',
             minimap: { enabled: false },
@@ -357,7 +395,7 @@ export default function App() {
         />
       </div>
 
-      {/* ── Pasted images strip ── */}
+      {/* ── Pasted images ── */}
       {pastedImages.length > 0 && (
         <div className={`shrink-0 border-t ${isDark ? 'border-[#3c3c3c] bg-[#252526]' : 'border-gray-200 bg-gray-50'}`}>
           <div className="flex items-center gap-3 px-4 py-2 overflow-x-auto">
@@ -366,13 +404,13 @@ export default function App() {
               <div key={img.id} className="relative group shrink-0">
                 <img src={img.dataUrl} alt="pasted" className="h-14 w-auto rounded border object-cover"
                   style={{ borderColor: isDark ? '#3c3c3c' : '#e5e7eb' }} />
-                <span className={`absolute bottom-0.5 left-0.5 text-[9px] px-1 rounded ${
-                  isDark ? 'bg-black/70 text-gray-300' : 'bg-black/50 text-white'
-                }`}>{img.width}×{img.height}</span>
-                <button
-                  onClick={() => setPastedImages(p => p.filter(i => i.id !== img.id))}
-                  className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-600 text-white text-[10px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                >×</button>
+                <span className={`absolute bottom-0.5 left-0.5 text-[9px] px-1 rounded ${isDark ? 'bg-black/70 text-gray-300' : 'bg-black/50 text-white'}`}>
+                  {img.width}×{img.height}
+                </span>
+                <button onClick={() => removeImage(img.id)}
+                  className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-600 text-white text-[10px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                  ×
+                </button>
               </div>
             ))}
           </div>
@@ -380,18 +418,12 @@ export default function App() {
       )}
 
       {/* ── Status bar ── */}
-      <div className={`h-6 shrink-0 flex items-center px-4 gap-3 text-[11px] ${
-        isDark ? 'bg-[#007acc] text-white' : 'bg-blue-600 text-white'
-      }`}>
+      <div className={`h-6 shrink-0 flex items-center px-4 gap-3 text-[11px] ${isDark ? 'bg-[#007acc] text-white' : 'bg-blue-600 text-white'}`}>
         <span className="capitalize">{language}</span>
         <span className="opacity-40">|</span>
         <span>UTF-8</span>
-        {pastedImages.length > 0 && (
-          <>
-            <span className="opacity-40">|</span>
-            <span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span>
-          </>
-        )}
+        {slug && <><span className="opacity-40">|</span><span className="opacity-70">/{slug}</span></>}
+        {pastedImages.length > 0 && <><span className="opacity-40">|</span><span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span></>}
       </div>
 
       {shareOpen && (
@@ -401,6 +433,7 @@ export default function App() {
           code={code}
           language={language}
           images={pastedImages}
+          currentSlug={slug}
         />
       )}
     </div>
