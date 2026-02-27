@@ -7,7 +7,7 @@ use tracing::info;
 
 pub async fn get_database() -> Database {
     let mongo_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mongodb+srv://manojseetaramdev_db_user:i1jm3zhrdVYoEQZk@cluster0.alofyrd.mongodb.net/".into());
+        .expect("DATABASE_URL must be set");
 
     let mut opts = ClientOptions::parse(&mongo_url)
         .await
@@ -26,7 +26,6 @@ pub async fn get_database() -> Database {
 pub async fn run_migrations(db: &Database) {
     let col = db.collection::<mongodb::bson::Document>("snippets");
 
-    // Unique index on slug
     let slug_idx = IndexModel::builder()
         .keys(doc! { "slug": 1 })
         .options(
@@ -37,7 +36,6 @@ pub async fn run_migrations(db: &Database) {
         )
         .build();
 
-    // Index on expires_at for TTL-style queries
     let expires_idx = IndexModel::builder()
         .keys(doc! { "expires_at": 1 })
         .options(
