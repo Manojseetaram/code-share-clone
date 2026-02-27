@@ -128,7 +128,7 @@ export default function App() {
           await fetch(`${BACKEND}/api/snippets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ slug, content: '// Start typing or paste your code here...\n\n', language: 'javascript' }),
+            body: JSON.stringify({ slug, content: '// Start typing or paste your code or image here...\n\n', language: 'javascript' }),
           })
           res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
         }
