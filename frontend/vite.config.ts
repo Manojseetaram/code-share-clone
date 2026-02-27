@@ -10,4 +10,5 @@ export default defineConfig({
       '/ws':  { target: 'ws://localhost:3001',  ws: true, changeOrigin: true },
     },
   },
+   appType: 'spa',   // 👈 ADD THIS
 })
