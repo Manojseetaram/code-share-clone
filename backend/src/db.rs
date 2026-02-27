@@ -45,11 +45,11 @@ pub async fn run_migrations(db: &Database) {
         )
         .build();
 
-    col.create_index(slug_idx)
+    col.create_index(slug_idx, None)
         .await
         .expect("Failed to create slug index");
 
-    col.create_index(expires_idx)
+    col.create_index(expires_idx, None)
         .await
         .expect("Failed to create expires_at index");
 

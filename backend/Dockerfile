@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --release
+# Build with openssl-tls for Linux/Render
+RUN cargo build --release --features use-openssl
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -25,6 +26,6 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /app/target/release/backend .
 
-EXPOSE 3003
+EXPOSE 3004
 
 CMD ["./backend"]

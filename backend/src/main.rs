@@ -161,9 +161,10 @@ fn never() -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+// v2 API: count_documents and find_one take an explicit None for options
 async fn slug_exists(col: &Collection<SnippetRow>, slug: &str) -> Result<bool, AppError> {
     Ok(col
-        .count_documents(doc! { "slug": slug })
+        .count_documents(doc! { "slug": slug }, None)
         .await
         .map_err(AppError::Db)?
         > 0)
@@ -218,7 +219,7 @@ async fn create_snippet(
         expires_at: never(),
     };
 
-    col.insert_one(row).await.map_err(AppError::Db)?;
+    col.insert_one(row, None).await.map_err(AppError::Db)?;
     info!("created /{slug}");
     Ok((StatusCode::CREATED, Json(CreateResponse { slug, expires_at: never() })))
 }
@@ -228,7 +229,7 @@ async fn get_snippet(
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let row = s.col()
-        .find_one(doc! { "slug": &slug })
+        .find_one(doc! { "slug": &slug }, None)
         .await
         .map_err(AppError::Db)?
         .ok_or_else(|| AppError::NotFound("Room not found".into()))?;
@@ -254,16 +255,16 @@ async fn patch_snippet(
     let col    = s.col();
     let filter = doc! { "slug": &slug };
     if let Some(c) = req.content {
-        col.update_one(filter.clone(), doc! { "$set": { "content": c } })
+        col.update_one(filter.clone(), doc! { "$set": { "content": c } }, None)
             .await.map_err(AppError::Db)?;
     }
     if let Some(l) = req.language {
-        col.update_one(filter.clone(), doc! { "$set": { "language": l } })
+        col.update_one(filter.clone(), doc! { "$set": { "language": l } }, None)
             .await.map_err(AppError::Db)?;
     }
     if let Some(i) = req.images {
         let b = to_bson(&i).unwrap();
-        col.update_one(filter, doc! { "$set": { "images": b } })
+        col.update_one(filter, doc! { "$set": { "images": b } }, None)
             .await.map_err(AppError::Db)?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -273,7 +274,7 @@ async fn delete_snippet(
     State(s): State<Arc<AppState>>,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    s.col().delete_one(doc! { "slug": &slug }).await.map_err(AppError::Db)?;
+    s.col().delete_one(doc! { "slug": &slug }, None).await.map_err(AppError::Db)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -309,28 +310,31 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<AppState>) {
                     let _ = col.update_one(
                         doc! { "slug": &slug2 },
                         doc! { "$set": { "content": content, "language": language } },
+                        None,
                     ).await;
                     let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastEdit {
                         content: content.clone(), language: language.clone(),
                     }).unwrap());
                 }
                 WsMsg::Image { ref image } => {
-                    let row = col.find_one(doc! { "slug": &slug2 }).await.ok().flatten();
+                    let row = col.find_one(doc! { "slug": &slug2 }, None).await.ok().flatten();
                     let mut imgs: Vec<ImageData> = row.map(|r| r.images).unwrap_or_default();
                     if !imgs.iter().any(|i| i.id == image.id) { imgs.push(image.clone()); }
                     let _ = col.update_one(
                         doc! { "slug": &slug2 },
                         doc! { "$set": { "images": to_bson(&imgs).unwrap() } },
+                        None,
                     ).await;
                     let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastImage { image: image.clone() }).unwrap());
                 }
                 WsMsg::RemoveImage { ref id } => {
-                    let row = col.find_one(doc! { "slug": &slug2 }).await.ok().flatten();
+                    let row = col.find_one(doc! { "slug": &slug2 }, None).await.ok().flatten();
                     let mut imgs: Vec<ImageData> = row.map(|r| r.images).unwrap_or_default();
                     imgs.retain(|i| &i.id != id);
                     let _ = col.update_one(
                         doc! { "slug": &slug2 },
                         doc! { "$set": { "images": to_bson(&imgs).unwrap() } },
+                        None,
                     ).await;
                     let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastRemoveImage { id: id.clone() }).unwrap());
                 }
@@ -388,7 +392,6 @@ async fn main() {
         )
         .init();
 
-    // Render sets PORT automatically — must read it
     let port: u16 = std::env::var("PORT")
         .unwrap_or_else(|_| "3004".into())
         .parse()
@@ -422,7 +425,6 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // Must be 0.0.0.0 — Render won't expose 127.0.0.1
     let addr = format!("0.0.0.0:{port}");
     info!("listening on http://{addr}");
     axum::serve(tokio::net::TcpListener::bind(&addr).await.unwrap(), app).await.unwrap();
