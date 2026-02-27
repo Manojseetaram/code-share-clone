@@ -5,18 +5,21 @@ import type * as Monaco from 'monaco-editor'
 import { useParams, useNavigate } from 'react-router-dom'
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-// Set VITE_BACKEND_URL=https://code-share-clone-6sj6.onrender.com in Vercel env vars
-// Dev: leave unset → Vite proxy handles /api and /ws → localhost:3001
 const BACKEND    = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? ''
 const WS_BACKEND = BACKEND
   ? BACKEND.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
-  : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
+  : 'ws://localhost:3003'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface PastedImage { id: string; url: string; width: number; height: number }
 interface BackendImage { id: string; url: string; width: number; height: number }
 const toBackendImage   = (img: PastedImage): BackendImage => ({ ...img })
 const fromBackendImage = (img: BackendImage): PastedImage => ({ ...img })
+
+// ─── Home page — redirect to a random room ───────────────────────────────────
+function randomSlug() {
+  return Math.random().toString(36).slice(2, 10)
+}
 
 // ─── Image lightbox ───────────────────────────────────────────────────────────
 function ImageViewer({ img, onClose }: { img: PastedImage; onClose: () => void }) {
@@ -33,133 +36,19 @@ function ImageViewer({ img, onClose }: { img: PastedImage; onClose: () => void }
   )
 }
 
-// ─── Share Modal ──────────────────────────────────────────────────────────────
-function ShareModal({ onClose, theme, code, language, images, currentSlug }: {
-  onClose: () => void; theme: 'dark' | 'light'; code: string
-  language: string; images: PastedImage[]; currentSlug?: string
-}) {
-  const isDark = theme === 'dark'
-  const navigate = useNavigate()
-  const [customSlug, setCustomSlug] = useState(currentSlug ?? '')
-  const [slugStatus, setSlugStatus] = useState<'idle'|'checking'|'available'|'taken'>('idle')
-  const [sharedUrl, setSharedUrl]   = useState(currentSlug ? `${window.location.origin}/${currentSlug}` : '')
-  const [copied, setCopied]         = useState(false)
-  const [loading, setLoading]       = useState(false)
-  const [error, setError]           = useState('')
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  const checkSlug = useCallback(async (v: string) => {
-    if (!v.trim()) { setSlugStatus('idle'); return }
-    if (v === currentSlug) { setSlugStatus('available'); return }
-    setSlugStatus('checking')
-    try {
-      const r = await fetch(`${BACKEND}/api/check/${encodeURIComponent(v)}`)
-      const d = await r.json()
-      setSlugStatus(d.available ? 'available' : 'taken')
-    } catch { setSlugStatus('idle') }
-  }, [currentSlug])
-
-  const handleSlugChange = (v: string) => {
-    setCustomSlug(v); setSharedUrl(''); setError('')
-    if (timer.current) clearTimeout(timer.current)
-    if (!v.trim()) { setSlugStatus('idle'); return }
-    setSlugStatus('checking')
-    timer.current = setTimeout(() => checkSlug(v), 400)
-  }
-
-  const handleShare = async () => {
-    setLoading(true); setError('')
-    try {
-      const res = await fetch(`${BACKEND}/api/snippets`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          slug: customSlug.trim() || undefined,
-          content: code, language,
-          images: images.length > 0 ? images.map(toBackendImage) : undefined,
-        }),
-      })
-      const data = await res.json()
-      if (!res.ok) { setError(data.error || 'Something went wrong'); return }
-      setSharedUrl(`${window.location.origin}/${data.slug}`)
-      navigate(`/${data.slug}`)
-    } catch { setError('Could not connect to server') }
-    finally { setLoading(false) }
-  }
-
-  const ic = isDark ? 'bg-[#2d2d2d] border-[#555] text-gray-200 focus:border-blue-500' : 'bg-gray-50 border-gray-300 text-gray-800 focus:border-blue-500'
-  const badge = () => {
-    if (slugStatus === 'checking')  return <span className="text-yellow-400 text-[11px]">checking…</span>
-    if (slugStatus === 'available') return <span className="text-green-400 text-[11px]">✓ available</span>
-    if (slugStatus === 'taken')     return <span className="text-red-400 text-[11px]">✗ taken</span>
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className={`w-[440px] mx-4 rounded-lg shadow-2xl border ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'}`}>
-        <div className={`flex items-center justify-between px-5 py-4 border-b ${isDark ? 'border-[#3c3c3c]' : 'border-gray-100'}`}>
-          <span className={`font-semibold text-sm ${isDark ? 'text-white' : 'text-gray-900'}`}>Share Snippet</span>
-          <button onClick={onClose} className={`text-xl leading-none ${isDark ? 'text-gray-400 hover:text-white' : 'text-gray-400 hover:text-gray-700'}`}>×</button>
-        </div>
-        <div className="px-5 py-5 flex flex-col gap-4">
-          {!sharedUrl && (
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>Custom URL <span className="opacity-50">(optional)</span></label>
-                {badge()}
-              </div>
-              <input value={customSlug} onChange={e => handleSlugChange(e.target.value)}
-                placeholder="e.g. manoj or my-snippet"
-                className={`w-full px-3 py-2 rounded border text-sm font-mono outline-none ${ic}`} />
-              {customSlug && (
-                <p className={`mt-1.5 text-[11px] font-mono ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                  {window.location.host}/<span className={isDark ? 'text-blue-400' : 'text-blue-600'}>{customSlug.toLowerCase().replace(/[^a-z0-9-]/g, '-')}</span>
-                </p>
-              )}
-            </div>
-          )}
-          {error && <p className="text-xs text-red-400 bg-red-400/10 px-3 py-2 rounded border border-red-400/20">{error}</p>}
-          {sharedUrl ? (
-            <div className="flex flex-col gap-3">
-              <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                ✅ Shared! Valid for <strong>24 hours</strong>.
-                {images.length > 0 && ` (${images.length} image${images.length > 1 ? 's' : ''} included)`}
-              </p>
-              <div className={`flex items-center gap-2 p-3 rounded border font-mono text-xs ${isDark ? 'bg-[#2d2d2d] border-[#444] text-gray-300' : 'bg-gray-50 border-gray-200 text-gray-700'}`}>
-                <span className="flex-1 truncate">{sharedUrl}</span>
-                <button onClick={() => { navigator.clipboard.writeText(sharedUrl); setCopied(true); setTimeout(() => setCopied(false), 2000) }}
-                  className={`shrink-0 px-2 py-1 rounded text-xs transition-colors ${copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}>
-                  {copied ? '✓' : 'Copy'}
-                </button>
-              </div>
-              <button onClick={onClose} className={`text-sm py-2 rounded border ${isDark ? 'border-[#555] text-gray-300 hover:bg-[#2d2d2d]' : 'border-gray-300 text-gray-600 hover:bg-gray-50'}`}>Close</button>
-            </div>
-          ) : (
-            <button onClick={handleShare} disabled={loading || slugStatus === 'taken' || slugStatus === 'checking'}
-              className="w-full py-2.5 rounded text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
-              {loading ? 'Sharing…' : 'Share'}
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const { slug } = useParams<{ slug?: string }>()
-  const navigate = useNavigate()
+  const navigate  = useNavigate()
 
   const [theme, setTheme]               = useState<'dark' | 'light'>('dark')
-  const [shareOpen, setShareOpen]       = useState(false)
   const [pastedImages, setPastedImages] = useState<PastedImage[]>([])
   const [viewerImage, setViewerImage]   = useState<PastedImage | null>(null)
   const [code, setCode]                 = useState('// Start typing or paste your code here...\n\n')
   const [language, setLanguage]         = useState('javascript')
-  const [loadError, setLoadError]       = useState('')
   const [viewers, setViewers]           = useState(1)
   const [wsReady, setWsReady]           = useState(false)
+  const [status, setStatus]             = useState<'loading' | 'ready' | 'error'>('loading')
 
   const editorRef   = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
   const monacoRef   = useRef<typeof Monaco | null>(null)
@@ -169,18 +58,69 @@ export default function App() {
   const reconnTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isDark      = theme === 'dark'
 
+  // ── If no slug → redirect to a new random room ────────────────────────────
+  useEffect(() => {
+    if (!slug) navigate(`/${randomSlug()}`, { replace: true })
+  }, [slug, navigate])
+
+  // ── Load or auto-create room ───────────────────────────────────────────────
+  useEffect(() => {
+    if (!slug) return
+    setStatus('loading')
+
+    async function loadOrCreate() {
+      try {
+        // Try to load existing room
+        let res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
+
+        // Room doesn't exist → create it automatically
+        if (res.status === 404) {
+          await fetch(`${BACKEND}/api/snippets`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              slug,
+              content: '// Start typing or paste your code here...\n\n',
+              language: 'javascript',
+            }),
+          })
+          // Load the freshly created room
+          res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
+        }
+
+        if (!res.ok) throw new Error('failed')
+
+        const data = await res.json()
+        isRemote.current = true
+        setCode(data.content)
+        setLanguage(data.language)
+        if (Array.isArray(data.images) && data.images.length > 0)
+          setPastedImages((data.images as BackendImage[]).map(fromBackendImage))
+        setTimeout(() => { isRemote.current = false }, 50)
+        setStatus('ready')
+      } catch {
+        setStatus('error')
+      }
+    }
+
+    loadOrCreate()
+  }, [slug])
+
   // ── WebSocket ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!slug) return
     let dead = false
+
     function connect() {
       if (dead) return
-      // Uses WS_BACKEND which points to Render — wss://code-share-clone-6sj6.onrender.com
       const ws = new WebSocket(`${WS_BACKEND}/ws/${slug}`)
       wsRef.current = ws
       ws.onopen  = () => { if (!dead) setWsReady(true) }
       ws.onerror = () => ws.close()
-      ws.onclose = () => { setWsReady(false); if (!dead) reconnTimer.current = setTimeout(connect, 3000) }
+      ws.onclose = () => {
+        setWsReady(false)
+        if (!dead) reconnTimer.current = setTimeout(connect, 3000)
+      }
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)
@@ -198,6 +138,7 @@ export default function App() {
         } catch {}
       }
     }
+
     connect()
     return () => {
       dead = true
@@ -211,28 +152,7 @@ export default function App() {
       wsRef.current.send(JSON.stringify(msg))
   }, [])
 
-  // ── Load snippet ───────────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!slug) return
-    setLoadError('')
-    // Uses BACKEND which points to Render — https://code-share-clone-6sj6.onrender.com
-    fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
-      .then(r => { if (!r.ok) throw new Error(); return r.json() })
-      .then(d => {
-        isRemote.current = true
-        setCode(d.content); setLanguage(d.language)
-        if (Array.isArray(d.images) && d.images.length > 0)
-          setPastedImages((d.images as BackendImage[]).map(fromBackendImage))
-        setTimeout(() => { isRemote.current = false }, 50)
-      })
-      .catch(() => {
-        setLoadError('')
-        setCode('// Start typing or paste your code here...\n\n')
-        setLanguage('javascript'); setPastedImages([])
-      })
-  }, [slug])
-
-  // ── Process image ──────────────────────────────────────────────────────────
+  // ── Process pasted image ───────────────────────────────────────────────────
   const processImage = useCallback((file: File) => {
     const reader = new FileReader()
     reader.onload = ev => {
@@ -253,7 +173,7 @@ export default function App() {
     editorRef.current = editor; monacoRef.current = monaco
   }, [])
 
-  // ── Paste handler ──────────────────────────────────────────────────────────
+  // ── Paste handler for images ───────────────────────────────────────────────
   useEffect(() => {
     const handler = (e: ClipboardEvent) => {
       const active = document.activeElement
@@ -269,7 +189,7 @@ export default function App() {
     return () => document.removeEventListener('paste', handler, true)
   }, [processImage])
 
-  // ── Code change ────────────────────────────────────────────────────────────
+  // ── Code change → debounce → WebSocket ────────────────────────────────────
   const handleCodeChange = useCallback((val: string | undefined) => {
     if (isRemote.current) return
     const v = val ?? ''
@@ -283,60 +203,112 @@ export default function App() {
     wsSend({ type: 'remove_image', id })
   }, [wsSend])
 
+  // ── Copy room URL ──────────────────────────────────────────────────────────
+  const [copied, setCopied] = useState(false)
+  const copyUrl = () => {
+    navigator.clipboard.writeText(window.location.href)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  if (!slug) return null
+
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }} className={isDark ? 'bg-[#1e1e1e]' : 'bg-white'}>
+
       {/* Navbar */}
       <nav className={`flex items-center justify-between px-5 h-12 shrink-0 border-b ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'}`}>
-        <a href="/" className={`text-base font-bold tracking-tight no-underline ${isDark ? 'text-white' : 'text-gray-900'}`}>
+        {/* Logo — click to go to a brand new room */}
+        <button onClick={() => navigate(`/${randomSlug()}`)}
+          className={`text-base font-bold tracking-tight ${isDark ? 'text-white' : 'text-gray-900'}`}>
           <span className={isDark ? 'text-blue-400' : 'text-blue-600'}>×</span>codeshare
-        </a>
+        </button>
+
         <div className="flex items-center gap-2">
-          {slug && <span title={wsReady ? 'Live' : 'Connecting…'} className={`w-2 h-2 rounded-full ${wsReady ? 'bg-green-500' : 'bg-yellow-400 animate-pulse'}`} />}
-          {slug && viewers > 1 && (
-            <span className={`text-xs px-2 py-0.5 rounded-full ${isDark ? 'bg-[#2d2d2d] text-gray-400' : 'bg-gray-100 text-gray-500'}`}>👁 {viewers}</span>
+          {/* Live indicator */}
+          <span title={wsReady ? 'Live' : 'Connecting…'}
+            className={`w-2 h-2 rounded-full ${wsReady ? 'bg-green-500' : 'bg-yellow-400 animate-pulse'}`} />
+
+          {/* Viewer count */}
+          {viewers > 1 && (
+            <span className={`text-xs px-2 py-0.5 rounded-full ${isDark ? 'bg-[#2d2d2d] text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
+              👁 {viewers}
+            </span>
           )}
+
+          {/* Theme toggle */}
           <button onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
             className={`w-8 h-8 rounded flex items-center justify-center text-sm transition-colors ${isDark ? 'hover:bg-[#2d2d2d] text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}>
             {isDark ? '☀' : '🌙'}
           </button>
-          <button onClick={() => setShareOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors">
-            <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
-            </svg>
-            Share
+
+          {/* Copy room URL — this IS the share button */}
+          <button onClick={copyUrl}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium transition-colors ${copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}>
+            {copied ? '✓ Copied!' : '🔗 Share'}
           </button>
         </div>
       </nav>
 
-      {loadError && (
-        <div className="bg-red-900/40 border-b border-red-800 text-red-300 text-xs px-5 py-2 flex items-center justify-between">
-          <span>{loadError}</span><a href="/" className="underline ml-2">Start new</a>
+      {/* Loading / error banner */}
+      {status === 'loading' && (
+        <div className={`text-xs px-5 py-2 ${isDark ? 'bg-[#2d2d2d] text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
+          Loading room…
+        </div>
+      )}
+      {status === 'error' && (
+        <div className="bg-red-900/40 border-b border-red-800 text-red-300 text-xs px-5 py-2">
+          Could not connect to server. Check your internet connection.
         </div>
       )}
 
+      {/* Monaco editor */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        <Editor height="100%" language={language} value={code} theme={isDark ? 'vs-dark' : 'vs'}
-          onChange={handleCodeChange} onMount={handleEditorMount}
+        <Editor
+          height="100%"
+          language={language}
+          value={code}
+          theme={isDark ? 'vs-dark' : 'vs'}
+          onChange={handleCodeChange}
+          onMount={handleEditorMount}
           options={{
-            fontSize: 14, fontFamily: "'Fira Code', 'Cascadia Code', Consolas, monospace",
-            fontLigatures: true, lineNumbers: 'on', minimap: { enabled: false },
-            scrollBeyondLastLine: false, padding: { top: 12, bottom: 12 },
-            renderLineHighlight: 'line', smoothScrolling: true, cursorBlinking: 'smooth',
-            wordWrap: 'off', automaticLayout: true, tabSize: 2, lineNumbersMinChars: 3,
-            glyphMargin: false, folding: true, renderValidationDecorations: 'off',
-            quickSuggestions: false, parameterHints: { enabled: false },
-            suggestOnTriggerCharacters: false, acceptSuggestionOnEnter: 'off',
-            tabCompletion: 'off', wordBasedSuggestions: 'off',
-            hover: { enabled: false }, contextmenu: false, lightbulb: { enabled: 'off' },
+            fontSize: 14,
+            fontFamily: "'Fira Code', 'Cascadia Code', Consolas, monospace",
+            fontLigatures: true,
+            lineNumbers: 'on',
+            minimap: { enabled: false },
+            scrollBeyondLastLine: false,
+            padding: { top: 12, bottom: 12 },
+            renderLineHighlight: 'line',
+            smoothScrolling: true,
+            cursorBlinking: 'smooth',
+            wordWrap: 'off',
+            automaticLayout: true,
+            tabSize: 2,
+            lineNumbersMinChars: 3,
+            glyphMargin: false,
+            folding: true,
+            renderValidationDecorations: 'off',
+            quickSuggestions: false,
+            parameterHints: { enabled: false },
+            suggestOnTriggerCharacters: false,
+            acceptSuggestionOnEnter: 'off',
+            tabCompletion: 'off',
+            wordBasedSuggestions: 'off',
+            hover: { enabled: false },
+            contextmenu: false,
+            lightbulb: { enabled: 'off' },
           }}
         />
       </div>
 
+      {/* Image strip */}
       {pastedImages.length > 0 && (
         <div className={`shrink-0 border-t ${isDark ? 'border-[#3c3c3c] bg-[#252526]' : 'border-gray-200 bg-gray-50'}`}>
           <div className="flex items-center gap-3 px-4 py-2 overflow-x-auto">
-            <span className={`text-xs shrink-0 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Images ({pastedImages.length})</span>
+            <span className={`text-xs shrink-0 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              Images ({pastedImages.length})
+            </span>
             {pastedImages.map(img => (
               <div key={img.id} className="relative group shrink-0 cursor-pointer" onClick={() => setViewerImage(img)}>
                 <img src={img.url} alt="pasted" className="h-14 w-auto rounded border object-cover"
@@ -352,14 +324,18 @@ export default function App() {
         </div>
       )}
 
+      {/* Status bar */}
       <div className={`h-6 shrink-0 flex items-center px-4 gap-3 text-[11px] ${isDark ? 'bg-[#007acc] text-white' : 'bg-blue-600 text-white'}`}>
         <span className="capitalize">{language}</span>
-        <span className="opacity-40">|</span><span>UTF-8</span>
-        {slug && <><span className="opacity-40">|</span><span className="opacity-70">/{slug}</span></>}
-        {pastedImages.length > 0 && <><span className="opacity-40">|</span><span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span></>}
+        <span className="opacity-40">|</span>
+        <span>UTF-8</span>
+        <span className="opacity-40">|</span>
+        <span className="opacity-70 font-mono">/{slug}</span>
+        {pastedImages.length > 0 && (
+          <><span className="opacity-40">|</span><span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span></>
+        )}
       </div>
 
-      {shareOpen && <ShareModal onClose={() => setShareOpen(false)} theme={theme} code={code} language={language} images={pastedImages} currentSlug={slug} />}
       {viewerImage && <ImageViewer img={viewerImage} onClose={() => setViewerImage(null)} />}
     </div>
   )
