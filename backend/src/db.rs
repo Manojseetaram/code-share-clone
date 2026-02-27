@@ -1,33 +1,59 @@
-use sqlx::PgPool;
+use mongodb::{
+    bson::doc,
+    options::{ClientOptions, IndexOptions},
+    Client, Database, IndexModel,
+};
 use tracing::info;
 
-pub async fn run_migrations(db: &PgPool) {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS snippets (
-            id TEXT PRIMARY KEY,
-            slug TEXT UNIQUE NOT NULL,
-            content TEXT NOT NULL DEFAULT '',
-            language TEXT NOT NULL DEFAULT 'javascript',
-            images JSONB NOT NULL DEFAULT '[]',
-            created_at TIMESTAMP NOT NULL,
-            expires_at TIMESTAMP NOT NULL
-        );
-        "#
-    )
-    .execute(db)
-    .await
-    .expect("Failed to create snippets table");
+pub async fn get_database() -> Database {
+    let mongo_url = std::env::var("MONGODB_URL")
+        .unwrap_or_else(|_| "mongodb://localhost:27017/".into());
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_snippets_slug ON snippets(slug)")
-        .execute(db)
+    let mut opts = ClientOptions::parse(&mongo_url)
         .await
-        .unwrap();
+        .expect("Failed to parse MongoDB URL");
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_snippets_expires ON snippets(expires_at)")
-        .execute(db)
+    opts.app_name = Some("backend".into());
+
+    let client = Client::with_options(opts).expect("Failed to create MongoDB client");
+    let db_name = std::env::var("MONGODB_DB").unwrap_or_else(|_| "snippets_db".into());
+    let db = client.database(&db_name);
+
+    run_migrations(&db).await;
+    db
+}
+
+pub async fn run_migrations(db: &Database) {
+    let col = db.collection::<mongodb::bson::Document>("snippets");
+
+    // Unique index on slug
+    let slug_idx = IndexModel::builder()
+        .keys(doc! { "slug": 1 })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .name("idx_snippets_slug".to_string())
+                .build(),
+        )
+        .build();
+
+    // Index on expires_at for TTL-style queries
+    let expires_idx = IndexModel::builder()
+        .keys(doc! { "expires_at": 1 })
+        .options(
+            IndexOptions::builder()
+                .name("idx_snippets_expires".to_string())
+                .build(),
+        )
+        .build();
+
+    col.create_index(slug_idx)
         .await
-        .unwrap();
+        .expect("Failed to create slug index");
 
-    info!("Postgres migrations complete");
+    col.create_index(expires_idx)
+        .await
+        .expect("Failed to create expires_at index");
+
+    info!("MongoDB indexes ready");
 }
