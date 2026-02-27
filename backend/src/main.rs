@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Multipart, Path, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{delete, get, post, patch},
@@ -10,11 +10,8 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    SqlitePool,
-};
-use std::{str::FromStr, sync::Arc};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -31,7 +28,7 @@ fn get_or_create_room(rooms: &Rooms, slug: &str) -> broadcast::Sender<String> {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: SqlitePool,
+    pub db: PgPool,
     pub rooms: Rooms,
 }
 
@@ -53,12 +50,10 @@ pub struct CreateRequest {
     pub images: Option<Vec<ImageData>>,
 }
 
-// ImageData includes the full base64 dataUrl — this is how images are
-// stored in SQLite AND broadcast over WebSocket to other users
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ImageData {
     pub id: String,
-    pub data_url: String,   // full base64 "data:image/png;base64,..."
+    pub url: String,
     pub width: u32,
     pub height: u32,
 }
@@ -84,9 +79,10 @@ pub struct SlugCheck {
     pub available: bool,
     pub slug: String,
 }
+
 mod error;
 mod db;
-// All WebSocket messages - serialized with snake_case type tag
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsMsg {
@@ -98,7 +94,7 @@ pub enum WsMsg {
     Connected     { slug: String, viewers: usize },
     Viewers       { count: usize },
     BroadcastEdit { content: String, language: String },
-    BroadcastImage       { image: ImageData },   // full dataUrl included
+    BroadcastImage       { image: ImageData },
     BroadcastRemoveImage { id: String },
 }
 
@@ -112,10 +108,13 @@ enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match self {
-            AppError::NotFound(m)  => (StatusCode::NOT_FOUND, m),
-            AppError::BadRequest(m)=> (StatusCode::BAD_REQUEST, m),
-            AppError::Conflict(m)  => (StatusCode::CONFLICT, m),
-            AppError::Db(e)        => { tracing::error!("db: {e}"); (StatusCode::INTERNAL_SERVER_ERROR, "database error".into()) },
+            AppError::NotFound(m)   => (StatusCode::NOT_FOUND, m),
+            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            AppError::Conflict(m)   => (StatusCode::CONFLICT, m),
+            AppError::Db(e)         => {
+                tracing::error!("db: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "database error".into())
+            }
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
     }
@@ -140,13 +139,13 @@ fn validate(slug: &str) -> Result<(), AppError> {
     }
     Ok(())
 }
+
 fn gen_slug() -> String {
     const ALPHABET: &[char] = &[
         'a','b','c','d','e','f','g','h','i','j','k','l','m',
         'n','o','p','q','r','s','t','u','v','w','x','y','z',
         '0','1','2','3','4','5','6','7','8','9',
     ];
-
     nanoid::nanoid!(8, ALPHABET)
 }
 
@@ -154,63 +153,110 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true }))
 }
 
-async fn check_slug(State(s): State<Arc<AppState>>, Path(raw): Path<String>) -> impl IntoResponse {
+async fn check_slug(
+    State(s): State<Arc<AppState>>,
+    Path(raw): Path<String>,
+) -> impl IntoResponse {
     let slug = sanitize(&raw);
     let valid = validate(&slug).is_ok();
     let taken: bool = if valid {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM snippets WHERE slug=? AND expires_at > datetime('now'))")
-            .bind(&slug).fetch_one(&s.db).await.unwrap_or(false)
-    } else { true };
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM snippets WHERE slug = $1 AND expires_at > NOW())"
+        )
+        .bind(&slug)
+        .fetch_one(&s.db)
+        .await
+        .unwrap_or(false)
+    } else {
+        true
+    };
     Json(SlugCheck { available: valid && !taken, slug })
 }
 
-async fn create_snippet(State(s): State<Arc<AppState>>, Json(req): Json<CreateRequest>) -> Result<impl IntoResponse, AppError> {
+async fn create_snippet(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<CreateRequest>,
+) -> Result<impl IntoResponse, AppError> {
     let slug = match req.slug.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => {
             let sl = sanitize(raw);
             validate(&sl)?;
-            let taken: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM snippets WHERE slug=? AND expires_at > datetime('now'))")
-                .bind(&sl).fetch_one(&s.db).await.map_err(AppError::Db)?;
+            let taken: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM snippets WHERE slug = $1 AND expires_at > NOW())"
+            )
+            .bind(&sl)
+            .fetch_one(&s.db)
+            .await
+            .map_err(AppError::Db)?;
             if taken { return Err(AppError::Conflict("URL already taken".into())); }
             sl
         }
         None => {
             let mut sl = gen_slug();
             for _ in 0..10 {
-                let taken: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM snippets WHERE slug=? AND expires_at > datetime('now'))")
-                    .bind(&sl).fetch_one(&s.db).await.map_err(AppError::Db)?;
+                let taken: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM snippets WHERE slug = $1 AND expires_at > NOW())"
+                )
+                .bind(&sl)
+                .fetch_one(&s.db)
+                .await
+                .map_err(AppError::Db)?;
                 if !taken { break; }
                 sl = gen_slug();
             }
             sl
         }
     };
+
     let id      = uuid::Uuid::new_v4().to_string();
     let lang    = req.language.unwrap_or_else(|| "javascript".into());
     let now     = Utc::now();
     let expires = now + Duration::hours(24);
-    // Images stored with full dataUrl — so loading any snippet also restores images
-    let images_json = req.images.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())).unwrap_or_else(|| "[]".into());
+    let images_json = req.images
+        .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|| "[]".into());
 
-    sqlx::query("INSERT INTO snippets (id,slug,content,language,images,created_at,expires_at) VALUES (?,?,?,?,?,?,?)")
-        .bind(&id).bind(&slug).bind(&req.content).bind(&lang)
-        .bind(&images_json).bind(now).bind(expires)
-        .execute(&s.db).await.map_err(AppError::Db)?;
+    sqlx::query(
+        "INSERT INTO snippets (id, slug, content, language, images, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+    )
+    .bind(&id)
+    .bind(&slug)
+    .bind(&req.content)
+    .bind(&lang)
+    .bind(&images_json)
+    .bind(now)
+    .bind(expires)
+    .execute(&s.db)
+    .await
+    .map_err(AppError::Db)?;
 
     info!("created /{slug}");
     Ok((StatusCode::CREATED, Json(CreateResponse { slug, expires_at: expires })))
 }
 
-async fn get_snippet(State(s): State<Arc<AppState>>, Path(slug): Path<String>) -> Result<impl IntoResponse, AppError> {
+async fn get_snippet(
+    State(s): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
     let row = sqlx::query_as::<_, SnippetRow>(
-        "SELECT slug,content,language,images,created_at,expires_at FROM snippets WHERE slug=? AND expires_at > datetime('now')"
-    ).bind(&slug).fetch_optional(&s.db).await.map_err(AppError::Db)?
-     .ok_or_else(|| AppError::NotFound("Snippet not found or expired".into()))?;
+        "SELECT slug, content, language, images, created_at, expires_at \
+         FROM snippets WHERE slug = $1 AND expires_at > NOW()"
+    )
+    .bind(&slug)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(AppError::Db)?
+    .ok_or_else(|| AppError::NotFound("Snippet not found or expired".into()))?;
 
     let images: Vec<ImageData> = serde_json::from_str(&row.images).unwrap_or_default();
     Ok(Json(SnippetResponse {
-        slug: row.slug, content: row.content, language: row.language,
-        images, created_at: row.created_at, expires_at: row.expires_at,
+        slug: row.slug,
+        content: row.content,
+        language: row.language,
+        images,
+        created_at: row.created_at,
+        expires_at: row.expires_at,
     }))
 }
 
@@ -221,19 +267,62 @@ struct PatchReq {
     images:   Option<Vec<ImageData>>,
 }
 
-async fn patch_snippet(State(s): State<Arc<AppState>>, Path(slug): Path<String>, Json(req): Json<PatchReq>) -> Result<impl IntoResponse, AppError> {
-    if let Some(c) = req.content  { sqlx::query("UPDATE snippets SET content=?  WHERE slug=? AND expires_at > datetime('now')").bind(c).bind(&slug).execute(&s.db).await.map_err(AppError::Db)?; }
-    if let Some(l) = req.language { sqlx::query("UPDATE snippets SET language=? WHERE slug=? AND expires_at > datetime('now')").bind(l).bind(&slug).execute(&s.db).await.map_err(AppError::Db)?; }
-    if let Some(i) = req.images   { let j = serde_json::to_string(&i).unwrap_or_else(|_| "[]".into()); sqlx::query("UPDATE snippets SET images=? WHERE slug=? AND expires_at > datetime('now')").bind(j).bind(&slug).execute(&s.db).await.map_err(AppError::Db)?; }
+async fn patch_snippet(
+    State(s): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    Json(req): Json<PatchReq>,
+) -> Result<impl IntoResponse, AppError> {
+    if let Some(c) = req.content {
+        sqlx::query(
+            "UPDATE snippets SET content = $1 WHERE slug = $2 AND expires_at > NOW()"
+        )
+        .bind(c)
+        .bind(&slug)
+        .execute(&s.db)
+        .await
+        .map_err(AppError::Db)?;
+    }
+    if let Some(l) = req.language {
+        sqlx::query(
+            "UPDATE snippets SET language = $1 WHERE slug = $2 AND expires_at > NOW()"
+        )
+        .bind(l)
+        .bind(&slug)
+        .execute(&s.db)
+        .await
+        .map_err(AppError::Db)?;
+    }
+    if let Some(i) = req.images {
+        let j = serde_json::to_string(&i).unwrap_or_else(|_| "[]".into());
+        sqlx::query(
+            "UPDATE snippets SET images = $1 WHERE slug = $2 AND expires_at > NOW()"
+        )
+        .bind(j)
+        .bind(&slug)
+        .execute(&s.db)
+        .await
+        .map_err(AppError::Db)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn delete_snippet(State(s): State<Arc<AppState>>, Path(slug): Path<String>) -> Result<impl IntoResponse, AppError> {
-    sqlx::query("DELETE FROM snippets WHERE slug=?").bind(&slug).execute(&s.db).await.map_err(AppError::Db)?;
+async fn delete_snippet(
+    State(s): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    sqlx::query("DELETE FROM snippets WHERE slug = $1")
+        .bind(&slug)
+        .execute(&s.db)
+        .await
+        .map_err(AppError::Db)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, Path(slug): Path<String>, State(s): State<Arc<AppState>>) -> impl IntoResponse {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Path(slug): Path<String>,
+    State(s): State<Arc<AppState>>,
+) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, slug, s))
 }
 
@@ -243,60 +332,95 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<AppState>) {
     let viewers = tx.receiver_count();
     let (mut sender, mut receiver) = socket.split();
 
-    // Send "connected" to this client
     let _ = sender.send(Message::Text(
         serde_json::to_string(&WsMsg::Connected { slug: slug.clone(), viewers }).unwrap().into()
     )).await;
 
-    // Tell everyone else about new viewer
     let _ = tx.send(serde_json::to_string(&WsMsg::Viewers { count: viewers + 1 }).unwrap());
 
     let slug2  = slug.clone();
     let state2 = state.clone();
     let tx2    = tx.clone();
 
-    // Receive from this client → persist + broadcast
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
             let msg: WsMsg = match serde_json::from_str(&text) { Ok(m) => m, Err(_) => continue };
             match msg {
                 WsMsg::Edit { ref content, ref language } => {
-                    // Persist
-                    let _ = sqlx::query("UPDATE snippets SET content=?, language=? WHERE slug=? AND expires_at > datetime('now')")
-                        .bind(content).bind(language).bind(&slug2).execute(&state2.db).await;
-                    // Broadcast (no dataUrl needed for text)
+                    let _ = sqlx::query(
+                        "UPDATE snippets SET content = $1, language = $2 \
+                         WHERE slug = $3 AND expires_at > NOW()"
+                    )
+                    .bind(content)
+                    .bind(language)
+                    .bind(&slug2)
+                    .execute(&state2.db)
+                    .await;
+
                     let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastEdit {
-                        content: content.clone(), language: language.clone(),
+                        content: content.clone(),
+                        language: language.clone(),
                     }).unwrap());
                 }
                 WsMsg::Image { ref image } => {
-                    // Persist image (with full dataUrl) to DB
-                    let row: String = sqlx::query_scalar("SELECT images FROM snippets WHERE slug=? AND expires_at > datetime('now')")
-                        .bind(&slug2).fetch_optional(&state2.db).await.ok().flatten().unwrap_or_else(|| "[]".into());
+                    let row: String = sqlx::query_scalar(
+                        "SELECT images FROM snippets WHERE slug = $1 AND expires_at > NOW()"
+                    )
+                    .bind(&slug2)
+                    .fetch_optional(&state2.db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "[]".into());
+
                     let mut imgs: Vec<ImageData> = serde_json::from_str(&row).unwrap_or_default();
                     if !imgs.iter().any(|i| i.id == image.id) { imgs.push(image.clone()); }
                     let json = serde_json::to_string(&imgs).unwrap();
-                    let _ = sqlx::query("UPDATE snippets SET images=? WHERE slug=?")
-                        .bind(json).bind(&slug2).execute(&state2.db).await;
-                    // ← Broadcast with FULL dataUrl so other clients can display the image
-                    let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastImage { image: image.clone() }).unwrap());
+
+                    let _ = sqlx::query(
+                        "UPDATE snippets SET images = $1 WHERE slug = $2"
+                    )
+                    .bind(json)
+                    .bind(&slug2)
+                    .execute(&state2.db)
+                    .await;
+
+                    let _ = tx2.send(
+                        serde_json::to_string(&WsMsg::BroadcastImage { image: image.clone() }).unwrap()
+                    );
                 }
                 WsMsg::RemoveImage { ref id } => {
-                    let row: String = sqlx::query_scalar("SELECT images FROM snippets WHERE slug=? AND expires_at > datetime('now')")
-                        .bind(&slug2).fetch_optional(&state2.db).await.ok().flatten().unwrap_or_else(|| "[]".into());
+                    let row: String = sqlx::query_scalar(
+                        "SELECT images FROM snippets WHERE slug = $1 AND expires_at > NOW()"
+                    )
+                    .bind(&slug2)
+                    .fetch_optional(&state2.db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "[]".into());
+
                     let mut imgs: Vec<ImageData> = serde_json::from_str(&row).unwrap_or_default();
                     imgs.retain(|i| &i.id != id);
                     let json = serde_json::to_string(&imgs).unwrap();
-                    let _ = sqlx::query("UPDATE snippets SET images=? WHERE slug=?")
-                        .bind(json).bind(&slug2).execute(&state2.db).await;
-                    let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastRemoveImage { id: id.clone() }).unwrap());
+
+                    let _ = sqlx::query(
+                        "UPDATE snippets SET images = $1 WHERE slug = $2"
+                    )
+                    .bind(json)
+                    .bind(&slug2)
+                    .execute(&state2.db)
+                    .await;
+
+                    let _ = tx2.send(
+                        serde_json::to_string(&WsMsg::BroadcastRemoveImage { id: id.clone() }).unwrap()
+                    );
                 }
                 _ => {}
             }
         }
     });
 
-    // Send from broadcast → this client
     let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             if sender.send(Message::Text(msg.into())).await.is_err() { break; }
@@ -313,65 +437,120 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<AppState>) {
     info!("ws disconnected /{slug}");
 }
 
-async fn cleanup(db: SqlitePool) {
+async fn cleanup(db: PgPool) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-        match sqlx::query("DELETE FROM snippets WHERE expires_at <= datetime('now')").execute(&db).await {
-            Ok(r) => info!("cleanup: removed {} snippets", r.rows_affected()),
+        match sqlx::query("DELETE FROM snippets WHERE expires_at <= NOW()")
+            .execute(&db)
+            .await
+        {
+            Ok(r)  => info!("cleanup: removed {} snippets", r.rows_affected()),
             Err(e) => tracing::error!("cleanup: {e}"),
         }
     }
 }
 
+async fn upload_image(
+    mut multipart: Multipart,
+) -> Result<Json<ImageData>, AppError> {
+    let cloud_name    = std::env::var("CLOUDINARY_CLOUD_NAME").unwrap();
+    let upload_preset = std::env::var("CLOUDINARY_UPLOAD_PRESET").unwrap();
+
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let data = field.bytes().await.unwrap();
+
+        let form = reqwest::multipart::Form::new()
+            .part("file", reqwest::multipart::Part::bytes(data.to_vec()))
+            .text("upload_preset", upload_preset);
+
+        let url = format!(
+            "https://api.cloudinary.com/v1_1/{}/image/upload",
+            cloud_name
+        );
+
+        let res = reqwest::Client::new()
+            .post(url)
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+
+        let json: serde_json::Value = res.json().await.unwrap();
+
+        return Ok(Json(ImageData {
+            id:     uuid::Uuid::new_v4().to_string(),
+            url:    json["secure_url"].as_str().unwrap().to_string(),
+            width:  json["width"].as_u64().unwrap() as u32,
+            height: json["height"].as_u64().unwrap() as u32,
+        }));
+    }
+
+    Err(AppError::BadRequest("No file".into()))
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "backend=info,tower_http=info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "backend=info,tower_http=info".into()),
+        )
         .init();
 
-    let db_url   = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://./codeshare.db".into());
-    let port: u16= std::env::var("PORT").unwrap_or_else(|_| "3001".into()).parse().unwrap_or(3001);
-    let frontend = std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:5173".into());
+    let db_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set");
 
-    let db = SqlitePoolOptions::new()
-        .max_connections(20)
-        .connect_with(SqliteConnectOptions::from_str(&db_url).expect("invalid DATABASE_URL").create_if_missing(true))
-        .await.expect("failed to connect sqlite");
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "3001".into())
+        .parse()
+        .unwrap();
 
-    sqlx::query("PRAGMA journal_mode=WAL").execute(&db).await.unwrap();
-    sqlx::query("PRAGMA foreign_keys=ON").execute(&db).await.unwrap();
-    sqlx::query("CREATE TABLE IF NOT EXISTS snippets (
-        id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE,
-        content TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT 'javascript',
-        images TEXT NOT NULL DEFAULT '[]',
-        created_at TEXT NOT NULL, expires_at TEXT NOT NULL
-    )").execute(&db).await.unwrap();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_slug ON snippets(slug)").execute(&db).await.unwrap();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_exp  ON snippets(expires_at)").execute(&db).await.unwrap();
+    let frontend = std::env::var("FRONTEND_URL")
+        .unwrap_or_else(|_| "http://localhost:5173".into());
+
+    let db = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to Postgres");
+
+    db::run_migrations(&db).await;
     info!("db ready");
 
-    let state = Arc::new(AppState { db: db.clone(), rooms: Arc::new(DashMap::new()) });
+    let state = Arc::new(AppState {
+        db: db.clone(),
+        rooms: Arc::new(DashMap::new()),
+    });
+
     tokio::spawn(cleanup(db));
 
     let cors = CorsLayer::new()
         .allow_origin(frontend.parse::<axum::http::HeaderValue>().unwrap())
-        .allow_methods(Any).allow_headers(Any);
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let app = Router::new()
-        .route("/health",              get(health))
-        .route("/api/check/:slug",     get(check_slug))
-        .route("/api/snippets",        post(create_snippet))
-        .route("/api/snippets/:slug",  get(get_snippet))
-        .route("/api/snippets/:slug",  patch(patch_snippet))
-        .route("/api/snippets/:slug",  delete(delete_snippet))
-        .route("/ws/:slug",            get(ws_handler))
+        .route("/health",             get(health))
+        .route("/api/upload",         post(upload_image))
+        .route("/api/check/:slug",    get(check_slug))
+        .route("/api/snippets",       post(create_snippet))
+        .route("/api/snippets/:slug", get(get_snippet))
+        .route("/api/snippets/:slug", patch(patch_snippet))
+        .route("/api/snippets/:slug", delete(delete_snippet))
+        .route("/ws/:slug",           get(ws_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
     info!("listening on http://{addr}");
-    axum::serve(tokio::net::TcpListener::bind(&addr).await.unwrap(), app).await.unwrap();
+
+    axum::serve(
+        tokio::net::TcpListener::bind(&addr).await.unwrap(),
+        app,
+    )
+    .await
+    .unwrap();
 }
