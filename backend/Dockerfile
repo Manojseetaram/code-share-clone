@@ -1,5 +1,6 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
-FROM rust:1.85-slim AS builder
+# Use `latest` so dependencies never require a newer rustc than what's installed
+FROM rust:latest AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
