@@ -1,69 +1,12 @@
-
 import './App.css'
-
 import { useState, useRef, useCallback, useEffect } from 'react'
 import Editor from '@monaco-editor/react'
 import type * as Monaco from 'monaco-editor'
 
-// ─── Share Modal ───
-function ShareModal({ onClose, theme }: { onClose: () => void; theme: 'dark' | 'light' }) {
-  const isDark = theme === 'dark'
-  const [slug, setSlug] = useState(() => {
-    const w1 = ['fast','cold','blue','wild','calm','grey','deep','bold']
-    const w2 = ['river','peak','star','loop','byte','node','fire','wave']
-    return `${w1[Math.floor(Math.random()*8)]}-${w2[Math.floor(Math.random()*8)]}-${Math.floor(Math.random()*9000)+1000}`
-  })
-  const [copied, setCopied] = useState(false)
+const API = 'http://localhost:3001'
 
-  const copy = () => {
-    navigator.clipboard.writeText(`https://codeshare.io/${slug.replace(/[^a-z0-9-]/gi,'-').toLowerCase()}`)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
+// ─── Types ───────────────────────────────────────────────────────────────────
 
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-      onClick={e => e.target === e.currentTarget && onClose()}
-    >
-      <div className={`w-[420px] mx-4 rounded-lg shadow-2xl border ${
-        isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'
-      }`}>
-        <div className={`flex items-center justify-between px-5 py-4 border-b ${isDark ? 'border-[#3c3c3c]' : 'border-gray-100'}`}>
-          <span className={`font-semibold ${isDark ? 'text-white' : 'text-gray-900'}`}>Share</span>
-          <button onClick={onClose} className={`text-xl leading-none ${isDark ? 'text-gray-400 hover:text-white' : 'text-gray-400 hover:text-gray-700'}`}>×</button>
-        </div>
-        <div className="px-5 py-5 flex flex-col gap-4">
-          <div>
-            <label className={`block text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>Custom URL</label>
-            <input
-              value={slug}
-              onChange={e => setSlug(e.target.value)}
-              className={`w-full px-3 py-2 rounded border text-sm font-mono outline-none ${
-                isDark
-                  ? 'bg-[#2d2d2d] border-[#555] text-gray-200 focus:border-blue-500'
-                  : 'bg-gray-50 border-gray-300 text-gray-800 focus:border-blue-500'
-              }`}
-            />
-            <p className={`mt-1.5 text-xs font-mono ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-              codeshare.io/<span className={isDark ? 'text-blue-400' : 'text-blue-600'}>{slug.replace(/[^a-z0-9-]/gi,'-').toLowerCase()}</span>
-            </p>
-          </div>
-          <button
-            onClick={copy}
-            className={`w-full py-2.5 rounded text-sm font-medium transition-colors ${
-              copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'
-            }`}
-          >
-            {copied ? '✓ Copied!' : 'Copy Link'}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── Main App ───
 interface PastedImage {
   id: string
   dataUrl: string
@@ -71,14 +14,227 @@ interface PastedImage {
   height: number
 }
 
+interface SnippetResponse {
+  slug: string
+  content: string
+  language: string
+  images: PastedImage[]
+  expires_at: string
+  url: string
+}
+
+
+
+function ShareModal({
+  onClose,
+  theme,
+  code,
+  language,
+  images,
+}: {
+  onClose: () => void
+  theme: 'dark' | 'light'
+  code: string
+  language: string
+  images: PastedImage[]
+}) {
+  const isDark = theme === 'dark'
+  const [slug, setSlug] = useState('')
+  const [slugStatus, setSlugStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle')
+  const [sharedUrl, setSharedUrl] = useState('')
+  const [copied, setCopied] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const checkTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Real-time slug availability check
+  const checkSlug = useCallback(async (value: string) => {
+    if (!value.trim()) { setSlugStatus('idle'); return }
+    setSlugStatus('checking')
+    try {
+      const res = await fetch(`${API}/api/check/${encodeURIComponent(value)}`)
+      const data = await res.json()
+      setSlugStatus(data.available ? 'available' : 'taken')
+    } catch {
+      setSlugStatus('idle')
+    }
+  }, [])
+
+  const handleSlugChange = (v: string) => {
+    setSlug(v)
+    setSharedUrl('')
+    if (checkTimer.current) clearTimeout(checkTimer.current)
+    if (!v.trim()) { setSlugStatus('idle'); return }
+    setSlugStatus('checking')
+    checkTimer.current = setTimeout(() => checkSlug(v), 400)
+  }
+
+  const handleShare = async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const res = await fetch(`${API}/api/snippets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slug: slug.trim() || undefined,
+          content: code,
+          language,
+          images: images.length > 0 ? images : undefined,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setError(data.error || 'Something went wrong')
+        return
+      }
+      const full = `${window.location.origin}/${data.slug}`
+      setSharedUrl(full)
+      // Update browser URL without reload
+      window.history.pushState({}, '', `/${data.slug}`)
+    } catch {
+      setError('Could not connect to server')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const copy = () => {
+    navigator.clipboard.writeText(sharedUrl)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  const slugIndicator = () => {
+    if (slugStatus === 'checking') return <span className="text-yellow-400">checking...</span>
+    if (slugStatus === 'available') return <span className="text-green-400">✓ available</span>
+    if (slugStatus === 'taken') return <span className="text-red-400">✗ taken</span>
+    return null
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      onClick={e => e.target === e.currentTarget && onClose()}
+    >
+      <div className={`w-[440px] mx-4 rounded-lg shadow-2xl border ${
+        isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'
+      }`}>
+        {/* Header */}
+        <div className={`flex items-center justify-between px-5 py-4 border-b ${isDark ? 'border-[#3c3c3c]' : 'border-gray-100'}`}>
+          <span className={`font-semibold ${isDark ? 'text-white' : 'text-gray-900'}`}>Share Snippet</span>
+          <button onClick={onClose} className={`text-xl leading-none ${isDark ? 'text-gray-400 hover:text-white' : 'text-gray-400 hover:text-gray-700'}`}>×</button>
+        </div>
+
+        <div className="px-5 py-5 flex flex-col gap-4">
+          {/* Custom URL input */}
+          {!sharedUrl && (
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <label className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                  Custom URL <span className={`text-[10px] ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>(optional)</span>
+                </label>
+                <span className="text-[11px]">{slugIndicator()}</span>
+              </div>
+              <input
+                value={slug}
+                onChange={e => handleSlugChange(e.target.value)}
+                placeholder="leave blank for auto-generated"
+                className={`w-full px-3 py-2 rounded border text-sm font-mono outline-none ${
+                  isDark
+                    ? 'bg-[#2d2d2d] border-[#555] text-gray-200 focus:border-blue-500'
+                    : 'bg-gray-50 border-gray-300 text-gray-800 focus:border-blue-500'
+                }`}
+              />
+              {slug && (
+                <p className={`mt-1.5 text-[11px] font-mono ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                  {window.location.host}/<span className={isDark ? 'text-blue-400' : 'text-blue-600'}>
+                    {slug.toLowerCase().replace(/[^a-z0-9-]/g, '-')}
+                  </span>
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Error */}
+          {error && (
+            <p className="text-xs text-red-400 bg-red-400/10 px-3 py-2 rounded border border-red-400/20">{error}</p>
+          )}
+
+          {/* Shared result */}
+          {sharedUrl ? (
+            <div className="flex flex-col gap-3">
+              <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                ✅ Snippet shared! Link is valid for <strong>24 hours</strong>.
+              </p>
+              <div className={`flex items-center gap-2 p-3 rounded border font-mono text-xs ${
+                isDark ? 'bg-[#2d2d2d] border-[#444] text-gray-300' : 'bg-gray-50 border-gray-200 text-gray-700'
+              }`}>
+                <span className="flex-1 truncate">{sharedUrl}</span>
+                <button
+                  onClick={copy}
+                  className={`shrink-0 px-2 py-1 rounded text-xs transition-colors ${
+                    copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'
+                  }`}
+                >
+                  {copied ? '✓' : 'Copy'}
+                </button>
+              </div>
+              <button onClick={onClose} className={`text-sm py-2 rounded border transition-colors ${
+                isDark ? 'border-[#555] text-gray-300 hover:bg-[#2d2d2d]' : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+              }`}>
+                Close
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={handleShare}
+              disabled={loading || slugStatus === 'taken' || slugStatus === 'checking'}
+              className="w-full py-2.5 rounded text-sm font-medium transition-colors bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loading ? 'Sharing...' : 'Share'}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark')
   const [shareOpen, setShareOpen] = useState(false)
   const [pastedImages, setPastedImages] = useState<PastedImage[]>([])
+  const [code, setCode] = useState(`// Start typing or paste your code here...\n\n`)
+  const [language, setLanguage] = useState('javascript')
+  const [loadError, setLoadError] = useState('')
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
   const monacoRef = useRef<typeof Monaco | null>(null)
   const isDark = theme === 'dark'
 
+  // ── Load snippet from URL on mount ──
+  useEffect(() => {
+    const slug = window.location.pathname.replace(/^\//, '')
+    if (!slug || slug === '') return
+
+    fetch(`${API}/api/snippets/${encodeURIComponent(slug)}`)
+      .then(res => {
+        if (!res.ok) throw new Error('not found')
+        return res.json() as Promise<SnippetResponse>
+      })
+      .then(data => {
+        setCode(data.content)
+        setLanguage(data.language)
+        if (data.images?.length) setPastedImages(data.images)
+      })
+      .catch(() => {
+        setLoadError('Snippet not found or has expired.')
+      })
+  }, [])
+
+  // ── Handle image paste ──
   const handlePaste = useCallback((e: ClipboardEvent) => {
     const items = e.clipboardData?.items
     if (!items) return
@@ -140,9 +296,9 @@ export default function App() {
       <nav className={`flex items-center justify-between px-5 h-12 shrink-0 border-b ${
         isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'
       }`}>
-        <span className={`text-base font-bold tracking-tight ${isDark ? 'text-white' : 'text-gray-900'}`}>
+        <a href="/" className={`text-base font-bold tracking-tight no-underline ${isDark ? 'text-white' : 'text-gray-900'}`}>
           <span className={isDark ? 'text-blue-400' : 'text-blue-600'}>×</span>codeshare
-        </span>
+        </a>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
@@ -164,13 +320,21 @@ export default function App() {
         </div>
       </nav>
 
+      {/* ── Error banner ── */}
+      {loadError && (
+        <div className="bg-red-900/40 border-b border-red-800 text-red-300 text-xs px-5 py-2">
+          {loadError}
+        </div>
+      )}
+
       {/* ── Monaco Editor ── */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
         <Editor
           height="100%"
-          defaultLanguage="javascript"
-          defaultValue={`// Start typing or paste your code here...\n\n`}
+          language={language}
+          value={code}
           theme={isDark ? 'vs-dark' : 'vs'}
+          onChange={v => setCode(v ?? '')}
           onMount={handleEditorMount}
           options={{
             fontSize: 14,
@@ -216,19 +380,29 @@ export default function App() {
       )}
 
       {/* ── Status bar ── */}
-      <div className="h-6 shrink-0 flex items-center px-4 gap-4 text-[11px] bg-blue-600 text-white">
-        <span>JavaScript</span>
-        <span className="opacity-50">|</span>
+      <div className={`h-6 shrink-0 flex items-center px-4 gap-3 text-[11px] ${
+        isDark ? 'bg-[#007acc] text-white' : 'bg-blue-600 text-white'
+      }`}>
+        <span className="capitalize">{language}</span>
+        <span className="opacity-40">|</span>
         <span>UTF-8</span>
-        <span className="opacity-50">|</span>
-        <span>Spaces: 2</span>
-        {pastedImages.length > 0 && <>
-          <span className="opacity-50">|</span>
-          <span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span>
-        </>}
+        {pastedImages.length > 0 && (
+          <>
+            <span className="opacity-40">|</span>
+            <span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span>
+          </>
+        )}
       </div>
 
-      {shareOpen && <ShareModal onClose={() => setShareOpen(false)} theme={theme} />}
+      {shareOpen && (
+        <ShareModal
+          onClose={() => setShareOpen(false)}
+          theme={theme}
+          code={code}
+          language={language}
+          images={pastedImages}
+        />
+      )}
     </div>
   )
 }
