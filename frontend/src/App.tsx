@@ -16,9 +16,62 @@ interface BackendImage { id: string; url: string; width: number; height: number 
 const toBackendImage   = (img: PastedImage): BackendImage => ({ ...img })
 const fromBackendImage = (img: BackendImage): PastedImage => ({ ...img })
 
-// ─── Home page — redirect to a random room ───────────────────────────────────
 function randomSlug() {
   return Math.random().toString(36).slice(2, 10)
+}
+
+// ─── Icons ────────────────────────────────────────────────────────────────────
+function IconSun() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+      <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+    </svg>
+  )
+}
+
+function IconMoon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+    </svg>
+  )
+}
+
+function IconLink() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+    </svg>
+  )
+}
+
+function IconCheck() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="20 6 9 17 4 12"/>
+    </svg>
+  )
+}
+
+function IconEye() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+      <circle cx="12" cy="12" r="3"/>
+    </svg>
+  )
+}
+
+function IconX() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+    </svg>
+  )
 }
 
 // ─── Image lightbox ───────────────────────────────────────────────────────────
@@ -31,7 +84,9 @@ function ImageViewer({ img, onClose }: { img: PastedImage; onClose: () => void }
   return (
     <div className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center" onClick={onClose}>
       <img src={img.url} alt="full" className="max-w-[90vw] max-h-[90vh] object-contain rounded shadow-2xl" onClick={e => e.stopPropagation()} />
-      <button onClick={onClose} className="absolute top-4 right-4 text-white text-2xl w-9 h-9 flex items-center justify-center rounded-full bg-black/50 hover:bg-black/80">×</button>
+      <button onClick={onClose} className="absolute top-4 right-4 text-white text-2xl w-9 h-9 flex items-center justify-center rounded-full bg-black/50 hover:bg-black/80">
+        <IconX />
+      </button>
     </div>
   )
 }
@@ -44,7 +99,7 @@ export default function App() {
   const [theme, setTheme]               = useState<'dark' | 'light'>('dark')
   const [pastedImages, setPastedImages] = useState<PastedImage[]>([])
   const [viewerImage, setViewerImage]   = useState<PastedImage | null>(null)
-  const [code, setCode]                 = useState('// Start typing or paste your code here...\n\n')
+  const [code, setCode]                 = useState('// Start typing or paste your code, image here...\n\n')
   const [language, setLanguage]         = useState('javascript')
   const [viewers, setViewers]           = useState(1)
   const [wsReady, setWsReady]           = useState(false)
@@ -58,38 +113,26 @@ export default function App() {
   const reconnTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isDark      = theme === 'dark'
 
-  // ── If no slug → redirect to a new random room ────────────────────────────
   useEffect(() => {
     if (!slug) navigate(`/${randomSlug()}`, { replace: true })
   }, [slug, navigate])
 
-  // ── Load or auto-create room ───────────────────────────────────────────────
   useEffect(() => {
     if (!slug) return
     setStatus('loading')
 
     async function loadOrCreate() {
       try {
-        // Try to load existing room
         let res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
-
-        // Room doesn't exist → create it automatically
         if (res.status === 404) {
           await fetch(`${BACKEND}/api/snippets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              slug,
-              content: '// Start typing or paste your code here...\n\n',
-              language: 'javascript',
-            }),
+            body: JSON.stringify({ slug, content: '// Start typing or paste your code here...\n\n', language: 'javascript' }),
           })
-          // Load the freshly created room
           res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
         }
-
         if (!res.ok) throw new Error('failed')
-
         const data = await res.json()
         isRemote.current = true
         setCode(data.content)
@@ -106,7 +149,6 @@ export default function App() {
     loadOrCreate()
   }, [slug])
 
-  // ── WebSocket ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!slug) return
     let dead = false
@@ -124,8 +166,8 @@ export default function App() {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)
-          if      (msg.type === 'connected')        setViewers(msg.viewers ?? 1)
-          else if (msg.type === 'viewers')          setViewers(msg.count ?? 1)
+          if      (msg.type === 'connected')       setViewers(msg.viewers ?? 1)
+          else if (msg.type === 'viewers')         setViewers(msg.count ?? 1)
           else if (msg.type === 'broadcast_edit') {
             isRemote.current = true
             setCode(msg.content); setLanguage(msg.language)
@@ -152,7 +194,6 @@ export default function App() {
       wsRef.current.send(JSON.stringify(msg))
   }, [])
 
-  // ── Process pasted image ───────────────────────────────────────────────────
   const processImage = useCallback((file: File) => {
     const reader = new FileReader()
     reader.onload = ev => {
@@ -168,12 +209,10 @@ export default function App() {
     reader.readAsDataURL(file)
   }, [wsSend])
 
-  // ── Monaco mount ───────────────────────────────────────────────────────────
   const handleEditorMount = useCallback((editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof Monaco) => {
     editorRef.current = editor; monacoRef.current = monaco
   }, [])
 
-  // ── Paste handler for images ───────────────────────────────────────────────
   useEffect(() => {
     const handler = (e: ClipboardEvent) => {
       const active = document.activeElement
@@ -189,7 +228,6 @@ export default function App() {
     return () => document.removeEventListener('paste', handler, true)
   }, [processImage])
 
-  // ── Code change → debounce → WebSocket ────────────────────────────────────
   const handleCodeChange = useCallback((val: string | undefined) => {
     if (isRemote.current) return
     const v = val ?? ''
@@ -203,7 +241,6 @@ export default function App() {
     wsSend({ type: 'remove_image', id })
   }, [wsSend])
 
-  // ── Copy room URL ──────────────────────────────────────────────────────────
   const [copied, setCopied] = useState(false)
   const copyUrl = () => {
     navigator.clipboard.writeText(window.location.href)
@@ -218,34 +255,42 @@ export default function App() {
 
       {/* Navbar */}
       <nav className={`flex items-center justify-between px-5 h-12 shrink-0 border-b ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'}`}>
-        {/* Logo — click to go to a brand new room */}
         <button onClick={() => navigate(`/${randomSlug()}`)}
           className={`text-base font-bold tracking-tight ${isDark ? 'text-white' : 'text-gray-900'}`}>
-          <span className={isDark ? 'text-blue-400' : 'text-blue-600'}>×</span>codeshare
+          <span className={isDark ? 'text-blue-400' : 'text-blue-600'}>×</span>devshare
         </button>
 
         <div className="flex items-center gap-2">
-          {/* Live indicator */}
-          <span title={wsReady ? 'Live' : 'Connecting…'}
-            className={`w-2 h-2 rounded-full ${wsReady ? 'bg-green-500' : 'bg-yellow-400 animate-pulse'}`} />
+          {/* Live dot */}
+          <span
+            title={wsReady ? 'Live' : 'Connecting…'}
+            className={`w-2 h-2 rounded-full ${wsReady ? 'bg-green-500' : 'bg-yellow-400 animate-pulse'}`}
+          />
 
           {/* Viewer count */}
           {viewers > 1 && (
-            <span className={`text-xs px-2 py-0.5 rounded-full ${isDark ? 'bg-[#2d2d2d] text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
-              👁 {viewers}
+            <span className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${isDark ? 'bg-[#2d2d2d] text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
+              <IconEye />
+              {viewers}
             </span>
           )}
 
           {/* Theme toggle */}
-          <button onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
-            className={`w-8 h-8 rounded flex items-center justify-center text-sm transition-colors ${isDark ? 'hover:bg-[#2d2d2d] text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}>
-            {isDark ? '☀' : '🌙'}
+          <button
+            onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+            title={isDark ? 'Switch to light' : 'Switch to dark'}
+            className={`w-8 h-8 rounded flex items-center justify-center transition-colors ${isDark ? 'hover:bg-[#2d2d2d] text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}
+          >
+            {isDark ? <IconSun /> : <IconMoon />}
           </button>
 
-          {/* Copy room URL — this IS the share button */}
-          <button onClick={copyUrl}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium transition-colors ${copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}>
-            {copied ? '✓ Copied!' : '🔗 Share'}
+          {/* Share button */}
+          <button
+            onClick={copyUrl}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium transition-colors ${copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}
+          >
+            {copied ? <IconCheck /> : <IconLink />}
+            {copied ? 'Copied' : 'Share'}
           </button>
         </div>
       </nav>
@@ -311,28 +356,34 @@ export default function App() {
             </span>
             {pastedImages.map(img => (
               <div key={img.id} className="relative group shrink-0 cursor-pointer" onClick={() => setViewerImage(img)}>
-                <img src={img.url} alt="pasted" className="h-14 w-auto rounded border object-cover"
-                  style={{ borderColor: isDark ? '#3c3c3c' : '#e5e7eb' }} />
+                <img
+                  src={img.url} alt="pasted"
+                  className="h-14 w-auto rounded border object-cover"
+                  style={{ borderColor: isDark ? '#3c3c3c' : '#e5e7eb' }}
+                />
                 <span className={`absolute bottom-0.5 left-0.5 text-[9px] px-1 rounded pointer-events-none ${isDark ? 'bg-black/70 text-gray-300' : 'bg-black/50 text-white'}`}>
                   {img.width}×{img.height}
                 </span>
-                <button onClick={e => { e.stopPropagation(); removeImage(img.id) }}
-                  className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-600 text-white text-[10px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">×</button>
+                <button
+                  onClick={e => { e.stopPropagation(); removeImage(img.id) }}
+                  className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                >
+                  <IconX />
+                </button>
               </div>
             ))}
           </div>
         </div>
       )}
 
-      {/* Status bar */}
+      {/* Status bar — room path only, no language */}
       <div className={`h-6 shrink-0 flex items-center px-4 gap-3 text-[11px] ${isDark ? 'bg-[#007acc] text-white' : 'bg-blue-600 text-white'}`}>
-        <span className="capitalize">{language}</span>
-        <span className="opacity-40">|</span>
-        <span>UTF-8</span>
-        <span className="opacity-40">|</span>
         <span className="opacity-70 font-mono">/{slug}</span>
         {pastedImages.length > 0 && (
-          <><span className="opacity-40">|</span><span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span></>
+          <>
+            <span className="opacity-40">|</span>
+            <span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span>
+          </>
         )}
       </div>
 
