@@ -7,6 +7,16 @@ import { useParams, useNavigate } from 'react-router-dom'
 // ─── Types ───────────────────────────────────────────────────────────────────
 interface PastedImage { id: string; dataUrl: string; width: number; height: number }
 
+// Helper: convert frontend PastedImage → backend ImageData shape
+function toBackendImage(img: PastedImage) {
+  return {
+    id: img.id,
+    data_url: img.dataUrl,   // camelCase → snake_case to match Rust struct
+    width: img.width,
+    height: img.height,
+  }
+}
+
 // ─── Image lightbox ───────────────────────────────────────────────────────────
 function ImageViewer({ img, onClose }: { img: PastedImage; onClose: () => void }) {
   useEffect(() => {
@@ -56,6 +66,7 @@ function ShareModal({ onClose, theme, code, language, images, currentSlug }: {
     timer.current = setTimeout(() => checkSlug(v), 400)
   }
 
+  // FIX: map images to snake_case before sending to backend
   const handleShare = async () => {
     setLoading(true); setError('')
     try {
@@ -64,8 +75,9 @@ function ShareModal({ onClose, theme, code, language, images, currentSlug }: {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           slug: customSlug.trim() || undefined,
-          content: code, language,
-          images: images.length > 0 ? images : undefined,
+          content: code,
+          language,
+          images: images.length > 0 ? images.map(toBackendImage) : undefined,
         }),
       })
       const data = await res.json()
@@ -155,7 +167,6 @@ export default function App() {
   const isRemote    = useRef(false)
   const sendTimer   = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const mountCount  = useRef(0)
   const isDark      = theme === 'dark'
 
   // ── WebSocket ─────────────────────────────────────────────────────────────
@@ -165,7 +176,6 @@ export default function App() {
 
     function connect() {
       if (dead) return
-      // ← CORRECT: use window.location.host so Vite proxy handles it
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const ws = new WebSocket(`${proto}//${window.location.host}/ws/${slug}`)
       wsRef.current = ws
@@ -187,8 +197,16 @@ export default function App() {
             setLanguage(msg.language)
             setTimeout(() => { isRemote.current = false }, 50)
           }
-          else if (msg.type === 'broadcast_image')
-            setPastedImages(p => p.find(i => i.id === msg.image.id) ? p : [...p, msg.image])
+          else if (msg.type === 'broadcast_image') {
+            // Backend sends data_url (snake_case) — convert back to camelCase for frontend
+            const img: PastedImage = {
+              id: msg.image.id,
+              dataUrl: msg.image.data_url,
+              width: msg.image.width,
+              height: msg.image.height,
+            }
+            setPastedImages(p => p.find(i => i.id === img.id) ? p : [...p, img])
+          }
           else if (msg.type === 'broadcast_remove_image')
             setPastedImages(p => p.filter(i => i.id !== msg.id))
         } catch {}
@@ -219,116 +237,86 @@ export default function App() {
         isRemote.current = true
         setCode(d.content)
         setLanguage(d.language)
-        if (Array.isArray(d.images) && d.images.length > 0) setPastedImages(d.images)
+        if (Array.isArray(d.images) && d.images.length > 0) {
+          // Backend returns data_url (snake_case) — convert to camelCase for frontend
+          const converted: PastedImage[] = d.images.map((img: { id: string; data_url: string; width: number; height: number }) => ({
+            id: img.id,
+            dataUrl: img.data_url,
+            width: img.width,
+            height: img.height,
+          }))
+          setPastedImages(converted)
+        }
         setTimeout(() => { isRemote.current = false }, 50)
       })
       .catch(() => setLoadError('Snippet not found or has expired.'))
   }, [slug])
 
   // ── Process image file ────────────────────────────────────────────────────
-  const processImage = useCallback((file: File) => {
-    const reader = new FileReader()
-    reader.onload = ev => {
-      const dataUrl = ev.target?.result as string
-      const image = new Image()
-      image.onload = () => {
-        const newImg: PastedImage = {
-          id: crypto.randomUUID(),
-          dataUrl,
-          width: image.naturalWidth,
-          height: image.naturalHeight,
-        }
-        setPastedImages(prev => [...prev, newImg])
-        wsSend({ type: 'image', image: newImg })
+const processImage = useCallback((file: File) => {
+  const reader = new FileReader()
 
-        const editor = editorRef.current
-        const monaco = monacoRef.current
-        if (editor && monaco) {
-          const pos = editor.getPosition()
-          if (pos) {
-            editor.executeEdits('img', [{
-              range: new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column),
-              text: `# [image: ${image.naturalWidth}×${image.naturalHeight}]\n`,
-            }])
-            editor.focus()
-          }
-        }
+  reader.onload = ev => {
+    const dataUrl = ev.target?.result as string
+    const image = new Image()
+
+    image.onload = () => {
+      const newImg: PastedImage = {
+        id: crypto.randomUUID(),
+        dataUrl,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
       }
-      image.src = dataUrl
+
+      // Show in image strip
+      setPastedImages(prev => [...prev, newImg])
+
+      // Send to backend
+      wsSend({ type: 'image', image: toBackendImage(newImg) })
     }
-    reader.readAsDataURL(file)
-  }, [wsSend])
+
+    image.src = dataUrl
+  }
+
+  reader.readAsDataURL(file)
+}, [wsSend])
 
   // ── Monaco mount ─────────────────────────────────────────────────────────
-  //
-  // ROOT CAUSE OF IMAGE PASTE NOT WORKING:
-  // Monaco wraps a hidden <textarea> for input. We must attach to that element
-  // using capture:true. BUT React StrictMode double-mounts in dev — so we track
-  // mount count and re-attach every time. The 'dead' flag per closure stops
-  // stale listeners from firing.
-  //
-const handleEditorMount = useCallback((
-  editor: Monaco.editor.IStandaloneCodeEditor,
-  monaco: typeof Monaco,
-) => {
-  editorRef.current = editor
-  monacoRef.current = monaco
+  const handleEditorMount = useCallback((
+    editor: Monaco.editor.IStandaloneCodeEditor,
+    monaco: typeof Monaco,
+  ) => {
+    editorRef.current = editor
+    monacoRef.current = monaco
+  }, [])
 
-  function attachListener() {
-    const dom = editor.getDomNode()
-    if (!dom) return
+  // ── Global paste handler for images ──────────────────────────────────────
+  useEffect(() => {
+    const handler = (e: ClipboardEvent) => {
+      const active = document.activeElement
+      if (!active) return
 
-    const textarea = dom.querySelector<HTMLTextAreaElement>('.inputarea')
-    if (!textarea) {
-      // Monaco not ready yet → retry
-      setTimeout(attachListener, 100)
-      return
+      const isMonaco =
+        active.classList.contains('inputarea') ||
+        !!active.closest('.monaco-editor')
+
+      if (!isMonaco) return
+
+      const items = Array.from(e.clipboardData?.items || [])
+      const imageItem = items.find(i => i.type.startsWith('image/'))
+      if (!imageItem) return
+
+      e.preventDefault()
+      e.stopPropagation()
+
+      const file = imageItem.getAsFile()
+      if (file) processImage(file)
     }
 
-    console.log("Found Monaco inputarea ✅")
+    document.addEventListener('paste', handler, true)
+    return () => document.removeEventListener('paste', handler, true)
+  }, [processImage])
 
-  const handler = (e: ClipboardEvent) => {
-  alert("PASTE DETECTED")
-}
-
-    textarea.addEventListener('paste', handler, true)
-  }
-
-  attachListener()
-}, [processImage])
-useEffect(() => {
-  const handler = (e: ClipboardEvent) => {
-    // Check if Monaco is focused
-    const active = document.activeElement
-    if (!active) return
-
-    const isMonaco =
-      active.classList.contains('inputarea') ||
-      active.closest('.monaco-editor')
-
-    if (!isMonaco) return
-
-    console.log("GLOBAL PASTE DETECTED")
-
-    const items = Array.from(e.clipboardData?.items || [])
-    console.log("Clipboard types:", items.map(i => i.type))
-
-    const imageItem = items.find(i => i.type.startsWith('image/'))
-    if (!imageItem) return
-
-    e.preventDefault()
-    e.stopPropagation()
-
-    const file = imageItem.getAsFile()
-    if (file) processImage(file)
-  }
-
-  document.addEventListener('paste', handler, true)
-
-  return () => {
-    document.removeEventListener('paste', handler, true)
-  }
-}, [processImage])
   // ── Code change ──────────────────────────────────────────────────────────
   const handleCodeChange = useCallback((val: string | undefined) => {
     if (isRemote.current) return
@@ -404,6 +392,18 @@ useEffect(() => {
             lineNumbersMinChars: 3,
             glyphMargin: false,
             folding: true,
+            // ── FIX: disable red error squiggles / validation decorations ──
+            renderValidationDecorations: 'off',
+            // ── FIX: disable command palette & unnecessary IDE features ──
+            quickSuggestions: false,
+            parameterHints: { enabled: false },
+            suggestOnTriggerCharacters: false,
+            acceptSuggestionOnEnter: 'off',
+            tabCompletion: 'off',
+            wordBasedSuggestions: 'off',
+            hover: { enabled: false },
+            contextmenu: false,
+            lightbulb: { enabled: 'off' },
           }}
         />
       </div>
