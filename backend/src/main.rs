@@ -390,7 +390,7 @@ async fn main() {
 
     // Render sets PORT automatically — must read it
     let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3003".into())
+        .unwrap_or_else(|_| "3004".into())
         .parse()
         .unwrap();
 

@@ -7,7 +7,7 @@ use tracing::info;
 
 pub async fn get_database() -> Database {
     let mongo_url = std::env::var("MONGODB_URL")
-        .unwrap_or_else(|_| "mongodb://localhost:27017/".into());
+        .unwrap_or_else(|_| "mongodb+srv://manojseetaramdev_db_user:i1jm3zhrdVYoEQZk@cluster0.alofyrd.mongodb.net/".into());
 
     let mut opts = ClientOptions::parse(&mongo_url)
         .await
