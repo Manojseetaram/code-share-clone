@@ -1,49 +1,33 @@
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use tracing::info;
 
-pub async fn run_migrations(db: &SqlitePool) {
-
-    sqlx::query("PRAGMA journal_mode=WAL")
-        .execute(db)
-        .await
-        .expect("Failed to enable WAL");
-
-    sqlx::query("PRAGMA foreign_keys=ON")
-        .execute(db)
-        .await
-        .expect("Failed to enable foreign keys");
-
-
+pub async fn run_migrations(db: &PgPool) {
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS snippets (
-            id          TEXT PRIMARY KEY,
-            slug        TEXT NOT NULL UNIQUE,
-            content     TEXT NOT NULL DEFAULT '',
-            language    TEXT NOT NULL DEFAULT 'javascript',
-            images      TEXT NOT NULL DEFAULT '[]',
-            created_at  TEXT NOT NULL,
-            expires_at  TEXT NOT NULL
-        )"
+        r#"
+        CREATE TABLE IF NOT EXISTS snippets (
+            id TEXT PRIMARY KEY,
+            slug TEXT UNIQUE NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            language TEXT NOT NULL DEFAULT 'javascript',
+            images JSONB NOT NULL DEFAULT '[]',
+            created_at TIMESTAMP NOT NULL,
+            expires_at TIMESTAMP NOT NULL
+        );
+        "#
     )
     .execute(db)
     .await
     .expect("Failed to create snippets table");
 
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_snippets_slug ON snippets(slug)")
+        .execute(db)
+        .await
+        .unwrap();
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_snippets_slug ON snippets(slug)"
-    )
-    .execute(db)
-    .await
-    .expect("Failed to create slug index");
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_snippets_expires ON snippets(expires_at)")
+        .execute(db)
+        .await
+        .unwrap();
 
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_snippets_expires ON snippets(expires_at)"
-    )
-    .execute(db)
-    .await
-    .expect("Failed to create expires index");
-
-    info!("Migrations complete");
+    info!("Postgres migrations complete");
 }
