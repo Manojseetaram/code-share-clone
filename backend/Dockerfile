@@ -1,5 +1,4 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
-# Use `latest` so dependencies never require a newer rustc than what's installed
 FROM rust:latest AS builder
 WORKDIR /app
 
@@ -24,5 +23,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /app/target/release/backend .
 
-EXPOSE 3001
+# Render sets PORT dynamically — default 3003 for local
+EXPOSE 3003
+
 CMD ["./backend"]
