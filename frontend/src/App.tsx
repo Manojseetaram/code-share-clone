@@ -249,7 +249,12 @@ export default function App() {
         }
         setTimeout(() => { isRemote.current = false }, 50)
       })
-      .catch(() => setLoadError('Snippet not found or has expired.'))
+      .catch(() => {
+  setLoadError('')
+  setCode('// Start typing or paste your code here...\n\n')
+  setLanguage('javascript')
+  setPastedImages([])
+})
   }, [slug])
 
   // ── Process image file ────────────────────────────────────────────────────
