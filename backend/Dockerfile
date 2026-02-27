@@ -18,12 +18,13 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    curl \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /app/target/release/backend .
 
-# Render sets PORT dynamically — default 3003 for local
 EXPOSE 3003
 
 CMD ["./backend"]
