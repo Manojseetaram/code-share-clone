@@ -267,13 +267,7 @@ export default function App() {
             className={`w-2 h-2 rounded-full ${wsReady ? 'bg-green-500' : 'bg-yellow-400 animate-pulse'}`}
           />
 
-          {/* Viewer count */}
-          {viewers > 1 && (
-            <span className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${isDark ? 'bg-[#2d2d2d] text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
-              <IconEye />
-              {viewers}
-            </span>
-          )}
+      
 
           {/* Theme toggle */}
           <button
