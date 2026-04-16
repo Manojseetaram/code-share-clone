@@ -16,8 +16,27 @@ interface BackendImage { id: string; url: string; width: number; height: number 
 const toBackendImage   = (img: PastedImage): BackendImage => ({ ...img })
 const fromBackendImage = (img: BackendImage): PastedImage => ({ ...img })
 
+// NEW
+interface SharedFile { id: string; name: string; url: string; size: number; mime: string }
+
 function randomSlug() {
   return Math.random().toString(36).slice(2, 10)
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function fileIcon(mime: string): string {
+  if (mime.startsWith('image/'))       return '🖼'
+  if (mime === 'application/zip' ||
+      mime === 'application/x-zip-compressed') return '🗜'
+  if (mime.startsWith('text/'))        return '📄'
+  if (mime.includes('pdf'))            return '📕'
+  if (mime.includes('json'))           return '📋'
+  return '📦'
 }
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
@@ -57,19 +76,30 @@ function IconCheck() {
   )
 }
 
-function IconEye() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-      <circle cx="12" cy="12" r="3"/>
-    </svg>
-  )
-}
-
 function IconX() {
   return (
     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
       <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+    </svg>
+  )
+}
+
+function IconUpload() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="16 16 12 12 8 16"/>
+      <line x1="12" y1="12" x2="12" y2="21"/>
+      <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
+    </svg>
+  )
+}
+
+function IconDownload() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="8 17 12 21 16 17"/>
+      <line x1="12" y1="21" x2="12" y2="3"/>
+      <path d="M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"/>
     </svg>
   )
 }
@@ -91,6 +121,114 @@ function ImageViewer({ img, onClose }: { img: PastedImage; onClose: () => void }
   )
 }
 
+// ─── File strip ───────────────────────────────────────────────────────────────
+function FileStrip({
+  files, isDark, slug, onRemove, uploading
+}: {
+  files: SharedFile[]
+  isDark: boolean
+  slug: string
+  onRemove: (id: string) => void
+  uploading: boolean
+}) {
+  const [downloading, setDownloading] = useState(false)
+
+  const downloadZip = async () => {
+    setDownloading(true)
+    try {
+      const res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}/download-zip`)
+      if (!res.ok) throw new Error('failed')
+      const blob = await res.blob()
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
+      a.href     = url
+      a.download = `${slug}.zip`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch {
+      alert('Download failed')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  return (
+    <div className={`shrink-0 border-t ${isDark ? 'border-[#3c3c3c] bg-[#252526]' : 'border-gray-200 bg-gray-50'}`}>
+      <div className="flex items-center gap-2 px-4 py-2 overflow-x-auto">
+
+        {/* Label + count */}
+        <span className={`text-xs shrink-0 font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+          Files ({files.length})
+        </span>
+
+        {/* File cards */}
+        {files.map(f => (
+          <div
+            key={f.id}
+            className={`group relative flex items-center gap-2 shrink-0 rounded px-2.5 py-1.5 text-xs border
+              ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c] text-gray-300' : 'bg-white border-gray-200 text-gray-700'}`}
+          >
+            <span className="text-base leading-none">{fileIcon(f.mime)}</span>
+            <div className="flex flex-col min-w-0 max-w-[120px]">
+              <span className="truncate font-medium leading-tight">{f.name}</span>
+              <span className={`text-[10px] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{formatBytes(f.size)}</span>
+            </div>
+            {/* Individual download */}
+            <a
+              href={f.url}
+              download={f.name}
+              target="_blank"
+              rel="noreferrer"
+              onClick={e => e.stopPropagation()}
+              className={`ml-1 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded
+                ${isDark ? 'text-blue-400 hover:text-blue-300' : 'text-blue-600 hover:text-blue-700'}`}
+              title="Download"
+            >
+              <IconDownload />
+            </a>
+            {/* Remove */}
+            <button
+              onClick={() => onRemove(f.id)}
+              className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+              title="Remove"
+            >
+              <IconX />
+            </button>
+          </div>
+        ))}
+
+        {/* Spinner while uploading */}
+        {uploading && (
+          <div className={`flex items-center gap-1.5 text-xs px-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+            <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+            </svg>
+            Uploading…
+          </div>
+        )}
+
+        {/* Download all as ZIP */}
+        {files.length > 1 && (
+          <button
+            onClick={downloadZip}
+            disabled={downloading}
+            className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium transition-colors ml-auto
+              ${downloading
+                ? 'opacity-50 cursor-not-allowed bg-gray-600 text-white'
+                : isDark
+                  ? 'bg-[#3c3c3c] hover:bg-[#4a4a4a] text-gray-200'
+                  : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
+              }`}
+          >
+            <IconDownload />
+            {downloading ? 'Zipping…' : 'Download all (.zip)'}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const { slug } = useParams<{ slug?: string }>()
@@ -98,12 +236,15 @@ export default function App() {
 
   const [theme, setTheme]               = useState<'dark' | 'light'>('dark')
   const [pastedImages, setPastedImages] = useState<PastedImage[]>([])
+  const [sharedFiles, setSharedFiles]   = useState<SharedFile[]>([])   // NEW
+  const [fileUploading, setFileUploading] = useState(false)             // NEW
   const [viewerImage, setViewerImage]   = useState<PastedImage | null>(null)
-  const [code, setCode]                 = useState('// Start typing or paste your code,image here...\n\n')
+  const [code, setCode]                 = useState('// Start typing or paste your code, image here...\n\n')
   const [language, setLanguage]         = useState('javascript')
   const [viewers, setViewers]           = useState(1)
   const [wsReady, setWsReady]           = useState(false)
   const [status, setStatus]             = useState<'loading' | 'ready' | 'error'>('loading')
+  const [isDraggingFile, setIsDraggingFile] = useState(false)  // NEW: drag visual
 
   const editorRef   = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
   const monacoRef   = useRef<typeof Monaco | null>(null)
@@ -111,6 +252,7 @@ export default function App() {
   const isRemote    = useRef(false)
   const sendTimer   = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)  // NEW
   const isDark      = theme === 'dark'
 
   useEffect(() => {
@@ -139,6 +281,8 @@ export default function App() {
         setLanguage(data.language)
         if (Array.isArray(data.images) && data.images.length > 0)
           setPastedImages((data.images as BackendImage[]).map(fromBackendImage))
+        if (Array.isArray(data.files) && data.files.length > 0)   // NEW
+          setSharedFiles(data.files as SharedFile[])
         setTimeout(() => { isRemote.current = false }, 50)
         setStatus('ready')
       } catch {
@@ -166,8 +310,8 @@ export default function App() {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)
-          if      (msg.type === 'connected')       setViewers(msg.viewers ?? 1)
-          else if (msg.type === 'viewers')         setViewers(msg.count ?? 1)
+          if      (msg.type === 'connected')             setViewers(msg.viewers ?? 1)
+          else if (msg.type === 'viewers')               setViewers(msg.count ?? 1)
           else if (msg.type === 'broadcast_edit') {
             isRemote.current = true
             setCode(msg.content); setLanguage(msg.language)
@@ -177,6 +321,11 @@ export default function App() {
             setPastedImages(p => p.find(i => i.id === msg.image.id) ? p : [...p, fromBackendImage(msg.image)])
           else if (msg.type === 'broadcast_remove_image')
             setPastedImages(p => p.filter(i => i.id !== msg.id))
+          // NEW: file sync
+          else if (msg.type === 'broadcast_file')
+            setSharedFiles(p => p.find(f => f.id === msg.file.id) ? p : [...p, msg.file as SharedFile])
+          else if (msg.type === 'broadcast_remove_file')
+            setSharedFiles(p => p.filter(f => f.id !== msg.id))
         } catch {}
       }
     }
@@ -193,6 +342,61 @@ export default function App() {
     if (wsRef.current?.readyState === WebSocket.OPEN)
       wsRef.current.send(JSON.stringify(msg))
   }, [])
+
+  // ── NEW: Upload a file to Cloudinary via backend, then broadcast via WS ──────
+  const uploadFile = useCallback(async (file: File) => {
+    setFileUploading(true)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const res  = await fetch(`${BACKEND}/api/upload-file`, { method: 'POST', body: form })
+      if (!res.ok) throw new Error('upload failed')
+      const fileData: SharedFile = await res.json()
+      setSharedFiles(prev => prev.find(f => f.id === fileData.id) ? prev : [...prev, fileData])
+      wsSend({ type: 'file', file: fileData })
+    } catch {
+      alert('File upload failed')
+    } finally {
+      setFileUploading(false)
+    }
+  }, [wsSend])
+
+  const removeFile = useCallback((id: string) => {
+    setSharedFiles(p => p.filter(f => f.id !== id))
+    wsSend({ type: 'remove_file', id })
+  }, [wsSend])
+
+  // ── Drag-and-drop files onto the whole page ───────────────────────────────
+  useEffect(() => {
+    const onDragOver = (e: DragEvent) => {
+      if (!e.dataTransfer?.types.includes('Files')) return
+      e.preventDefault()
+      setIsDraggingFile(true)
+    }
+    const onDragLeave = (e: DragEvent) => {
+      if (!(e.relatedTarget instanceof Node)) setIsDraggingFile(false)
+    }
+    const onDrop = async (e: DragEvent) => {
+      e.preventDefault()
+      setIsDraggingFile(false)
+      const items = Array.from(e.dataTransfer?.files ?? [])
+      for (const file of items) {
+        if (file.type.startsWith('image/')) {
+          processImage(file)      // images go to image strip as before
+        } else {
+          await uploadFile(file)  // everything else → file strip
+        }
+      }
+    }
+    document.addEventListener('dragover',  onDragOver)
+    document.addEventListener('dragleave', onDragLeave)
+    document.addEventListener('drop',      onDrop)
+    return () => {
+      document.removeEventListener('dragover',  onDragOver)
+      document.removeEventListener('dragleave', onDragLeave)
+      document.removeEventListener('drop',      onDrop)
+    }
+  }, [uploadFile])  // processImage added below
 
   const processImage = useCallback((file: File) => {
     const reader = new FileReader()
@@ -253,6 +457,15 @@ export default function App() {
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }} className={isDark ? 'bg-[#1e1e1e]' : 'bg-white'}>
 
+      {/* Drag overlay */}
+      {isDraggingFile && (
+        <div className="fixed inset-0 z-50 bg-blue-600/20 border-4 border-dashed border-blue-500 flex items-center justify-center pointer-events-none">
+          <div className="bg-blue-600 text-white px-6 py-3 rounded-xl text-lg font-semibold shadow-2xl">
+            Drop files to share
+          </div>
+        </div>
+      )}
+
       {/* Navbar */}
       <nav className={`flex items-center justify-between px-5 h-12 shrink-0 border-b ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'}`}>
         <button onClick={() => navigate(`/${randomSlug()}`)}
@@ -267,7 +480,30 @@ export default function App() {
             className={`w-2 h-2 rounded-full ${wsReady ? 'bg-green-500' : 'bg-yellow-400 animate-pulse'}`}
           />
 
-      
+          {/* NEW: Upload file button */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            className="hidden"
+            multiple
+            onChange={async e => {
+              const files = Array.from(e.target.files ?? [])
+              for (const f of files) {
+                if (f.type.startsWith('image/')) processImage(f)
+                else await uploadFile(f)
+              }
+              e.target.value = ''
+            }}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            title="Upload file"
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium transition-colors
+              ${isDark ? 'hover:bg-[#2d2d2d] text-gray-400 hover:text-gray-200' : 'hover:bg-gray-100 text-gray-500 hover:text-gray-700'}`}
+          >
+            <IconUpload />
+            <span>Upload</span>
+          </button>
 
           {/* Theme toggle */}
           <button
@@ -370,13 +606,30 @@ export default function App() {
         </div>
       )}
 
-      {/* Status bar — room path only, no language */}
+      {/* NEW: File strip */}
+      {(sharedFiles.length > 0 || fileUploading) && slug && (
+        <FileStrip
+          files={sharedFiles}
+          isDark={isDark}
+          slug={slug}
+          onRemove={removeFile}
+          uploading={fileUploading}
+        />
+      )}
+
+      {/* Status bar */}
       <div className={`h-6 shrink-0 flex items-center px-4 gap-3 text-[11px] ${isDark ? 'bg-[#007acc] text-white' : 'bg-blue-600 text-white'}`}>
         <span className="opacity-70 font-mono">/{slug}</span>
         {pastedImages.length > 0 && (
           <>
             <span className="opacity-40">|</span>
             <span>{pastedImages.length} image{pastedImages.length > 1 ? 's' : ''}</span>
+          </>
+        )}
+        {sharedFiles.length > 0 && (
+          <>
+            <span className="opacity-40">|</span>
+            <span>{sharedFiles.length} file{sharedFiles.length > 1 ? 's' : ''}</span>
           </>
         )}
       </div>
