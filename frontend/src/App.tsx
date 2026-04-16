@@ -156,6 +156,24 @@ function FileStrip({
 }) {
   const [downloading, setDownloading] = useState(false)
 
+  // All downloads go through the backend proxy so Cloudinary CORS/Content-Disposition
+  // issues are avoided entirely. The backend fetches the bytes and streams them back
+  // with proper headers.
+  const proxyUrl = (fileId: string) =>
+    `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/files/${encodeURIComponent(fileId)}`
+
+  const downloadSingle = async (f: SharedFile) => {
+    const res  = await fetchWithRetry(proxyUrl(f.id))
+    if (!res.ok) { alert('Download failed'); return }
+    const blob = await res.blob()
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = f.name
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   const downloadZip = async () => {
     setDownloading(true)
     try {
@@ -196,19 +214,15 @@ function FileStrip({
               <span className="truncate font-medium leading-tight">{f.name}</span>
               <span className={`text-[10px] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{formatBytes(f.size)}</span>
             </div>
-            {/* Individual download */}
-            <a
-              href={f.url}
-              download={f.name}
-              target="_blank"
-              rel="noreferrer"
-              onClick={e => e.stopPropagation()}
+            {/* Individual download — via backend proxy, not direct Cloudinary URL */}
+            <button
+              onClick={() => downloadSingle(f)}
               className={`ml-1 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded
                 ${isDark ? 'text-blue-400 hover:text-blue-300' : 'text-blue-600 hover:text-blue-700'}`}
               title="Download"
             >
               <IconDownload />
-            </a>
+            </button>
             {/* Remove */}
             <button
               onClick={() => onRemove(f.id)}
@@ -262,7 +276,7 @@ export default function App() {
   const [sharedFiles, setSharedFiles]     = useState<SharedFile[]>([])
   const [fileUploading, setFileUploading] = useState(false)
   const [viewerImage, setViewerImage]     = useState<PastedImage | null>(null)
-  const [code, setCode]                   = useState('// Start typing or paste your code, image and zip file here...\n\n')
+  const [code, setCode]                   = useState('// Start typing or paste your code, image here...\n\n')
   const [language, setLanguage]           = useState('javascript')
   const [viewers, setViewers]             = useState(1)
   const [wsReady, setWsReady]             = useState(false)
