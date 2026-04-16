@@ -16,7 +16,6 @@ interface BackendImage { id: string; url: string; width: number; height: number 
 const toBackendImage   = (img: PastedImage): BackendImage => ({ ...img })
 const fromBackendImage = (img: BackendImage): PastedImage => ({ ...img })
 
-// NEW
 interface SharedFile { id: string; name: string; url: string; size: number; mime: string }
 
 function randomSlug() {
@@ -37,6 +36,30 @@ function fileIcon(mime: string): string {
   if (mime.includes('pdf'))            return '📕'
   if (mime.includes('json'))           return '📋'
   return '📦'
+}
+
+// ─── Fetch with retry (handles Render cold-start 502s) ───────────────────────
+async function fetchWithRetry(
+  url: string,
+  options?: RequestInit,
+  retries = 4,
+  delayMs = 2000,
+): Promise<Response> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, options)
+      // Retry on 502/503/504 (Render cold start / proxy errors)
+      if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < retries) {
+        await new Promise(r => setTimeout(r, delayMs * (attempt + 1)))
+        continue
+      }
+      return res
+    } catch (err) {
+      if (attempt === retries) throw err
+      await new Promise(r => setTimeout(r, delayMs * (attempt + 1)))
+    }
+  }
+  throw new Error('All retries exhausted')
 }
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
@@ -136,7 +159,7 @@ function FileStrip({
   const downloadZip = async () => {
     setDownloading(true)
     try {
-      const res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}/download-zip`)
+      const res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}/download-zip`)
       if (!res.ok) throw new Error('failed')
       const blob = await res.blob()
       const url  = URL.createObjectURL(blob)
@@ -234,26 +257,26 @@ export default function App() {
   const { slug } = useParams<{ slug?: string }>()
   const navigate  = useNavigate()
 
-  const [theme, setTheme]               = useState<'dark' | 'light'>('dark')
-  const [pastedImages, setPastedImages] = useState<PastedImage[]>([])
-  const [sharedFiles, setSharedFiles]   = useState<SharedFile[]>([])   // NEW
-  const [fileUploading, setFileUploading] = useState(false)             // NEW
-  const [viewerImage, setViewerImage]   = useState<PastedImage | null>(null)
-  const [code, setCode]                 = useState('// Start typing or paste your code, image here...\n\n')
-  const [language, setLanguage]         = useState('javascript')
-  const [viewers, setViewers]           = useState(1)
-  const [wsReady, setWsReady]           = useState(false)
-  const [status, setStatus]             = useState<'loading' | 'ready' | 'error'>('loading')
-  const [isDraggingFile, setIsDraggingFile] = useState(false)  // NEW: drag visual
+  const [theme, setTheme]                 = useState<'dark' | 'light'>('dark')
+  const [pastedImages, setPastedImages]   = useState<PastedImage[]>([])
+  const [sharedFiles, setSharedFiles]     = useState<SharedFile[]>([])
+  const [fileUploading, setFileUploading] = useState(false)
+  const [viewerImage, setViewerImage]     = useState<PastedImage | null>(null)
+  const [code, setCode]                   = useState('// Start typing or paste your code, image here...\n\n')
+  const [language, setLanguage]           = useState('javascript')
+  const [viewers, setViewers]             = useState(1)
+  const [wsReady, setWsReady]             = useState(false)
+  const [status, setStatus]               = useState<'loading' | 'ready' | 'error' | 'waking'>('loading')
+  const [isDraggingFile, setIsDraggingFile] = useState(false)
 
-  const editorRef   = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
-  const monacoRef   = useRef<typeof Monaco | null>(null)
-  const wsRef       = useRef<WebSocket | null>(null)
-  const isRemote    = useRef(false)
-  const sendTimer   = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const reconnTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)  // NEW
-  const isDark      = theme === 'dark'
+  const editorRef    = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
+  const monacoRef    = useRef<typeof Monaco | null>(null)
+  const wsRef        = useRef<WebSocket | null>(null)
+  const isRemote     = useRef(false)
+  const sendTimer    = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const reconnTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const isDark       = theme === 'dark'
 
   useEffect(() => {
     if (!slug) navigate(`/${randomSlug()}`, { replace: true })
@@ -265,23 +288,37 @@ export default function App() {
 
     async function loadOrCreate() {
       try {
-        let res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
+        // fetchWithRetry handles 502 cold-start responses from Render
+        let res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
+
+        // Show "waking up" message while retrying
+        if (!res.ok && res.status !== 404) {
+          setStatus('waking')
+          res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`, undefined, 6, 3000)
+        }
+
         if (res.status === 404) {
-          await fetch(`${BACKEND}/api/snippets`, {
+          await fetchWithRetry(`${BACKEND}/api/snippets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ slug, content: '// Start typing or paste your code or image here...\n\n', language: 'javascript' }),
+            body: JSON.stringify({
+              slug,
+              content: '// Start typing or paste your code or image here...\n\n',
+              language: 'javascript',
+            }),
           })
-          res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
+          res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
         }
+
         if (!res.ok) throw new Error('failed')
+
         const data = await res.json()
         isRemote.current = true
         setCode(data.content)
         setLanguage(data.language)
         if (Array.isArray(data.images) && data.images.length > 0)
           setPastedImages((data.images as BackendImage[]).map(fromBackendImage))
-        if (Array.isArray(data.files) && data.files.length > 0)   // NEW
+        if (Array.isArray(data.files) && data.files.length > 0)
           setSharedFiles(data.files as SharedFile[])
         setTimeout(() => { isRemote.current = false }, 50)
         setStatus('ready')
@@ -310,8 +347,8 @@ export default function App() {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)
-          if      (msg.type === 'connected')             setViewers(msg.viewers ?? 1)
-          else if (msg.type === 'viewers')               setViewers(msg.count ?? 1)
+          if      (msg.type === 'connected')              setViewers(msg.viewers ?? 1)
+          else if (msg.type === 'viewers')                setViewers(msg.count ?? 1)
           else if (msg.type === 'broadcast_edit') {
             isRemote.current = true
             setCode(msg.content); setLanguage(msg.language)
@@ -321,7 +358,6 @@ export default function App() {
             setPastedImages(p => p.find(i => i.id === msg.image.id) ? p : [...p, fromBackendImage(msg.image)])
           else if (msg.type === 'broadcast_remove_image')
             setPastedImages(p => p.filter(i => i.id !== msg.id))
-          // NEW: file sync
           else if (msg.type === 'broadcast_file')
             setSharedFiles(p => p.find(f => f.id === msg.file.id) ? p : [...p, msg.file as SharedFile])
           else if (msg.type === 'broadcast_remove_file')
@@ -343,19 +379,20 @@ export default function App() {
       wsRef.current.send(JSON.stringify(msg))
   }, [])
 
-  // ── NEW: Upload a file to Cloudinary via backend, then broadcast via WS ──────
+  // ── Upload a file to Cloudinary via backend, then broadcast via WS ──────────
   const uploadFile = useCallback(async (file: File) => {
     setFileUploading(true)
     try {
       const form = new FormData()
       form.append('file', file)
-      const res  = await fetch(`${BACKEND}/api/upload-file`, { method: 'POST', body: form })
+      // fetchWithRetry here handles cold-start 502s on upload too
+      const res = await fetchWithRetry(`${BACKEND}/api/upload-file`, { method: 'POST', body: form })
       if (!res.ok) throw new Error('upload failed')
       const fileData: SharedFile = await res.json()
       setSharedFiles(prev => prev.find(f => f.id === fileData.id) ? prev : [...prev, fileData])
       wsSend({ type: 'file', file: fileData })
     } catch {
-      alert('File upload failed')
+      alert('File upload failed. The server may be waking up — please try again in a moment.')
     } finally {
       setFileUploading(false)
     }
@@ -382,9 +419,9 @@ export default function App() {
       const items = Array.from(e.dataTransfer?.files ?? [])
       for (const file of items) {
         if (file.type.startsWith('image/')) {
-          processImage(file)      // images go to image strip as before
+          processImage(file)
         } else {
-          await uploadFile(file)  // everything else → file strip
+          await uploadFile(file)
         }
       }
     }
@@ -396,7 +433,7 @@ export default function App() {
       document.removeEventListener('dragleave', onDragLeave)
       document.removeEventListener('drop',      onDrop)
     }
-  }, [uploadFile])  // processImage added below
+  }, [uploadFile])
 
   const processImage = useCallback((file: File) => {
     const reader = new FileReader()
@@ -404,7 +441,10 @@ export default function App() {
       const url = ev.target?.result as string
       const image = new Image()
       image.onload = () => {
-        const newImg: PastedImage = { id: crypto.randomUUID(), url, width: image.naturalWidth, height: image.naturalHeight }
+        const newImg: PastedImage = {
+          id: crypto.randomUUID(), url,
+          width: image.naturalWidth, height: image.naturalHeight,
+        }
         setPastedImages(prev => [...prev, newImg])
         wsSend({ type: 'image', image: toBackendImage(newImg) })
       }
@@ -468,8 +508,10 @@ export default function App() {
 
       {/* Navbar */}
       <nav className={`flex items-center justify-between px-5 h-12 shrink-0 border-b ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c]' : 'bg-white border-gray-200'}`}>
-        <button onClick={() => navigate(`/${randomSlug()}`)}
-          className={`text-base font-bold tracking-tight ${isDark ? 'text-white' : 'text-gray-900'}`}>
+        <button
+          onClick={() => navigate(`/${randomSlug()}`)}
+          className={`text-base font-bold tracking-tight ${isDark ? 'text-white' : 'text-gray-900'}`}
+        >
           <span className={isDark ? 'text-blue-400' : 'text-blue-600'}>×</span>devshare
         </button>
 
@@ -480,7 +522,7 @@ export default function App() {
             className={`w-2 h-2 rounded-full ${wsReady ? 'bg-green-500' : 'bg-yellow-400 animate-pulse'}`}
           />
 
-          {/* NEW: Upload file button */}
+          {/* Upload file button */}
           <input
             ref={fileInputRef}
             type="file"
@@ -525,10 +567,18 @@ export default function App() {
         </div>
       </nav>
 
-      {/* Loading / error banner */}
+      {/* Status banners */}
       {status === 'loading' && (
         <div className={`text-xs px-5 py-2 ${isDark ? 'bg-[#2d2d2d] text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
           Loading room…
+        </div>
+      )}
+      {status === 'waking' && (
+        <div className={`text-xs px-5 py-2 flex items-center gap-2 ${isDark ? 'bg-yellow-900/30 text-yellow-300' : 'bg-yellow-50 text-yellow-700'}`}>
+          <svg className="animate-spin w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+          </svg>
+          Server is waking up — this may take a few seconds…
         </div>
       )}
       {status === 'error' && (
@@ -606,7 +656,7 @@ export default function App() {
         </div>
       )}
 
-      {/* NEW: File strip */}
+      {/* File strip */}
       {(sharedFiles.length > 0 || fileUploading) && slug && (
         <FileStrip
           files={sharedFiles}
@@ -620,6 +670,12 @@ export default function App() {
       {/* Status bar */}
       <div className={`h-6 shrink-0 flex items-center px-4 gap-3 text-[11px] ${isDark ? 'bg-[#007acc] text-white' : 'bg-blue-600 text-white'}`}>
         <span className="opacity-70 font-mono">/{slug}</span>
+        {viewers > 0 && (
+          <>
+            <span className="opacity-40">|</span>
+            <span>{viewers} viewer{viewers !== 1 ? 's' : ''}</span>
+          </>
+        )}
         {pastedImages.length > 0 && (
           <>
             <span className="opacity-40">|</span>
