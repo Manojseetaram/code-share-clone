@@ -1,9 +1,9 @@
 use axum::{
     body::Body,
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Multipart, Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderName, Method, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post, patch},
+    routing::{delete, get, patch, post},
     Router,
 };
 use bson::{doc, to_bson};
@@ -15,7 +15,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use zip::write::FileOptions;
@@ -25,7 +25,9 @@ mod db;
 type Rooms = Arc<DashMap<String, broadcast::Sender<String>>>;
 
 fn get_or_create_room(rooms: &Rooms, slug: &str) -> broadcast::Sender<String> {
-    if let Some(tx) = rooms.get(slug) { return tx.clone(); }
+    if let Some(tx) = rooms.get(slug) {
+        return tx.clone();
+    }
     let (tx, _) = broadcast::channel(128);
     rooms.insert(slug.to_string(), tx.clone());
     tx
@@ -49,7 +51,7 @@ pub struct SnippetRow {
     pub content:    String,
     pub language:   String,
     pub images:     Vec<ImageData>,
-    pub files:      Vec<FileData>,       // ← NEW
+    pub files:      Vec<FileData>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -70,14 +72,13 @@ pub struct ImageData {
     pub height: u32,
 }
 
-// ── NEW: file metadata stored in MongoDB ────────────────────────────────────
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileData {
-    pub id:        String,   // uuid
-    pub name:      String,   // original filename
-    pub url:       String,   // Cloudinary secure_url (raw resource)
-    pub size:      u64,      // bytes
-    pub mime:      String,   // e.g. "application/zip"
+    pub id:   String,   // uuid
+    pub name: String,   // original filename
+    pub url:  String,   // Cloudinary secure_url (raw resource)
+    pub size: u64,      // bytes
+    pub mime: String,   // e.g. "application/zip"
 }
 
 #[derive(Debug, Serialize)]
@@ -109,15 +110,15 @@ pub enum WsMsg {
     Edit                 { content: String, language: String },
     Image                { image: ImageData },
     RemoveImage          { id: String },
-    File                 { file: FileData },       // ← NEW
-    RemoveFile           { id: String },            // ← NEW
+    File                 { file: FileData },
+    RemoveFile           { id: String },
     Connected            { slug: String, viewers: usize },
     Viewers              { count: usize },
     BroadcastEdit        { content: String, language: String },
     BroadcastImage       { image: ImageData },
     BroadcastRemoveImage { id: String },
-    BroadcastFile        { file: FileData },        // ← NEW
-    BroadcastRemoveFile  { id: String },            // ← NEW
+    BroadcastFile        { file: FileData },
+    BroadcastRemoveFile  { id: String },
 }
 
 enum AppError {
@@ -189,7 +190,7 @@ async fn slug_exists(col: &Collection<SnippetRow>, slug: &str) -> Result<bool, A
         > 0)
 }
 
-// ── Handlers ─────────────────────────────────────────────────────────────────
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "ok": true }))
@@ -236,7 +237,7 @@ async fn create_snippet(
         content:    req.content,
         language:   req.language.unwrap_or_else(|| "javascript".into()),
         images:     req.images.unwrap_or_default(),
-        files:      vec![],                          // ← NEW
+        files:      vec![],
         created_at: Utc::now(),
         expires_at: never(),
     };
@@ -301,13 +302,12 @@ async fn delete_snippet(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ── NEW: Upload a file (any type) to Cloudinary as a raw resource ─────────────
+// ── Upload a file (any type) to Cloudinary as a raw resource ──────────────────
 async fn upload_file(mut multipart: Multipart) -> Result<Json<FileData>, AppError> {
     let cloud_name    = std::env::var("CLOUDINARY_CLOUD_NAME").unwrap();
     let upload_preset = std::env::var("CLOUDINARY_UPLOAD_PRESET").unwrap();
 
     while let Some(field) = multipart.next_field().await.unwrap() {
-        // Grab original filename and content-type before consuming the field
         let original_name = field
             .file_name()
             .unwrap_or("file")
@@ -320,12 +320,11 @@ async fn upload_file(mut multipart: Multipart) -> Result<Json<FileData>, AppErro
         let data = field.bytes().await.unwrap();
         let size = data.len() as u64;
 
-        // Upload as "raw" resource type so Cloudinary stores it as-is
         let form = reqwest::multipart::Form::new()
             .part("file", reqwest::multipart::Part::bytes(data.to_vec())
                 .file_name(original_name.clone()))
             .text("upload_preset", upload_preset)
-            .text("resource_type", "raw");        // ← key: store any file type
+            .text("resource_type", "raw");
 
         let url = format!(
             "https://api.cloudinary.com/v1_1/{}/raw/upload",
@@ -345,12 +344,11 @@ async fn upload_file(mut multipart: Multipart) -> Result<Json<FileData>, AppErro
     Err(AppError::BadRequest("No file provided".into()))
 }
 
-// ── NEW: Download all files in a room as a ZIP ────────────────────────────────
+// ── Download all files in a room as a ZIP ─────────────────────────────────────
 async fn download_zip(
     State(s): State<Arc<AppState>>,
     Path(slug): Path<String>,
 ) -> Result<Response, AppError> {
-    // 1. Load snippet
     let row = s.col()
         .find_one(doc! { "slug": &slug }, None)
         .await
@@ -361,8 +359,7 @@ async fn download_zip(
         return Err(AppError::BadRequest("No files to download".into()));
     }
 
-    // 2. Build ZIP in memory
-    let buf = Vec::new();
+    let buf    = Vec::new();
     let cursor = std::io::Cursor::new(buf);
     let mut zip = zip::ZipWriter::new(cursor);
     let options = FileOptions::default()
@@ -371,7 +368,6 @@ async fn download_zip(
     let http = reqwest::Client::new();
 
     for file in &row.files {
-        // Fetch each file from Cloudinary
         let bytes = http
             .get(&file.url)
             .send()
@@ -389,11 +385,10 @@ async fn download_zip(
             .map_err(|e| AppError::Internal(format!("zip write: {e}")))?;
     }
 
-    let cursor = zip.finish()
+    let cursor   = zip.finish()
         .map_err(|e| AppError::Internal(format!("zip finish: {e}")))?;
     let zip_bytes = cursor.into_inner();
 
-    // 3. Stream back
     let zip_name = format!("{slug}.zip");
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -406,7 +401,7 @@ async fn download_zip(
         .unwrap())
 }
 
-// ── Image upload (unchanged) ──────────────────────────────────────────────────
+// ── Image upload ──────────────────────────────────────────────────────────────
 async fn upload_image(mut multipart: Multipart) -> Result<Json<ImageData>, AppError> {
     let cloud_name    = std::env::var("CLOUDINARY_CLOUD_NAME").unwrap();
     let upload_preset = std::env::var("CLOUDINARY_UPLOAD_PRESET").unwrap();
@@ -490,8 +485,6 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<AppState>) {
                     ).await;
                     let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastRemoveImage { id: id.clone() }).unwrap());
                 }
-
-                // ── NEW: file added ──────────────────────────────────────────
                 WsMsg::File { ref file } => {
                     let row = col.find_one(doc! { "slug": &slug2 }, None).await.ok().flatten();
                     let mut files: Vec<FileData> = row.map(|r| r.files).unwrap_or_default();
@@ -503,8 +496,6 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<AppState>) {
                     ).await;
                     let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastFile { file: file.clone() }).unwrap());
                 }
-
-                // ── NEW: file removed ────────────────────────────────────────
                 WsMsg::RemoveFile { ref id } => {
                     let row = col.find_one(doc! { "slug": &slug2 }, None).await.ok().flatten();
                     let mut files: Vec<FileData> = row.map(|r| r.files).unwrap_or_default();
@@ -516,7 +507,6 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<AppState>) {
                     ).await;
                     let _ = tx2.send(serde_json::to_string(&WsMsg::BroadcastRemoveFile { id: id.clone() }).unwrap());
                 }
-
                 _ => {}
             }
         }
@@ -563,23 +553,40 @@ async fn main() {
 
     let state = Arc::new(AppState { db, rooms: Arc::new(DashMap::new()) });
 
+    // ── CORS: explicit methods + headers so Render's proxy doesn't strip them ──
     let cors = CorsLayer::new()
         .allow_origin(
-            frontend.parse::<axum::http::HeaderValue>().expect("Invalid FRONTEND_URL"),
+            frontend
+                .parse::<axum::http::HeaderValue>()
+                .expect("Invalid FRONTEND_URL"),
         )
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("x-requested-with"),
+        ]);
 
+    // ── Router: chain methods on the same path — do NOT use separate .route() ──
+    //    calls for the same path because each one silently replaces the previous.
     let app = Router::new()
         .route("/health",                          get(health))
         .route("/api/upload",                      post(upload_image))
-        .route("/api/upload-file",                 post(upload_file))          // ← NEW
+        .route("/api/upload-file",                 post(upload_file))
         .route("/api/check/:slug",                 get(check_slug))
         .route("/api/snippets",                    post(create_snippet))
-        .route("/api/snippets/:slug",              get(get_snippet))
-        .route("/api/snippets/:slug",              patch(patch_snippet))
-        .route("/api/snippets/:slug",              delete(delete_snippet))
-        .route("/api/snippets/:slug/download-zip", get(download_zip))          // ← NEW
+        // ↓ FIXED: get/patch/delete chained on the same path
+        .route(
+            "/api/snippets/:slug",
+            get(get_snippet).patch(patch_snippet).delete(delete_snippet),
+        )
+        .route("/api/snippets/:slug/download-zip", get(download_zip))
         .route("/ws/:slug",                        get(ws_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
