@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+use urlencoding;
 use zip::write::FileOptions;
 
 mod db;
@@ -401,6 +402,54 @@ async fn download_zip(
         .unwrap())
 }
 
+// ── Proxy: stream a single file from Cloudinary with correct headers ──────────
+// This avoids CORS issues and ensures the browser receives Content-Disposition.
+async fn proxy_file(
+    State(s): State<Arc<AppState>>,
+    Path((slug, file_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    // Look up the file metadata in MongoDB
+    let row = s.col()
+        .find_one(doc! { "slug": &slug }, None)
+        .await
+        .map_err(AppError::Db)?
+        .ok_or_else(|| AppError::NotFound("Room not found".into()))?;
+
+    let file = row
+        .files
+        .into_iter()
+        .find(|f| f.id == file_id)
+        .ok_or_else(|| AppError::NotFound("File not found".into()))?;
+
+    // Fetch the actual bytes from Cloudinary server-side
+    let bytes = reqwest::Client::new()
+        .get(&file.url)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("fetch failed: {e}")))?
+        .bytes()
+        .await
+        .map_err(|e| AppError::Internal(format!("read body failed: {e}")))?;
+
+    // Encode filename for Content-Disposition (handles spaces, unicode, etc.)
+    let encoded_name = urlencoding::encode(&file.name);
+    let disposition  = format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        file.name.replace('"', "\\\""),
+        encoded_name,
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE,        file.mime)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CONTENT_LENGTH,      bytes.len().to_string())
+        // Allow the Vercel frontend to read this response
+        .header("Access-Control-Allow-Origin", "*")
+        .body(Body::from(bytes))
+        .unwrap())
+}
+
 // ── Image upload ──────────────────────────────────────────────────────────────
 async fn upload_image(mut multipart: Multipart) -> Result<Json<ImageData>, AppError> {
     let cloud_name    = std::env::var("CLOUDINARY_CLOUD_NAME").unwrap();
@@ -586,7 +635,8 @@ async fn main() {
             "/api/snippets/:slug",
             get(get_snippet).patch(patch_snippet).delete(delete_snippet),
         )
-        .route("/api/snippets/:slug/download-zip", get(download_zip))
+        .route("/api/snippets/:slug/download-zip",          get(download_zip))
+        .route("/api/snippets/:slug/files/:file_id",        get(proxy_file))
         .route("/ws/:slug",                        get(ws_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
