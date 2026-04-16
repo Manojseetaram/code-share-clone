@@ -262,7 +262,7 @@ export default function App() {
   const [sharedFiles, setSharedFiles]     = useState<SharedFile[]>([])
   const [fileUploading, setFileUploading] = useState(false)
   const [viewerImage, setViewerImage]     = useState<PastedImage | null>(null)
-  const [code, setCode]                   = useState('// Start typing or paste your code, image here...\n\n')
+  const [code, setCode]                   = useState('// Start typing or paste your code, image and zip file here...\n\n')
   const [language, setLanguage]           = useState('javascript')
   const [viewers, setViewers]             = useState(1)
   const [wsReady, setWsReady]             = useState(false)
