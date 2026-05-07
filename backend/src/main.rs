@@ -402,8 +402,6 @@ async fn download_zip(
         .unwrap())
 }
 
-// ── Proxy: stream a single file from Cloudinary with correct headers ──────────
-// This avoids CORS issues and ensures the browser receives Content-Disposition.
 async fn proxy_file(
     State(s): State<Arc<AppState>>,
     Path((slug, file_id)): Path<(String, String)>,
@@ -602,7 +600,7 @@ async fn main() {
 
     let state = Arc::new(AppState { db, rooms: Arc::new(DashMap::new()) });
 
-    // ── CORS: explicit methods + headers so Render's proxy doesn't strip them ──
+
     let cors = CorsLayer::new()
         .allow_origin(
             frontend
