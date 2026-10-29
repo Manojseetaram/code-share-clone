@@ -825,7 +825,7 @@ export default function App() {
             acceptSuggestionOnEnter: 'off',
             tabCompletion: 'off',
             wordBasedSuggestions: 'off',
-            hover: { enabled: false },
+  hover: { enabled: "off" },
             contextmenu: false,
           }}
         />
