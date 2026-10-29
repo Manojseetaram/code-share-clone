@@ -1,3 +1,5 @@
+use aws_sdk_s3::Client;
+use aws_sdk_s3::types::ObjectCannedAcl;
 use axum::{
     body::Body,
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Multipart, Path, State},
@@ -38,6 +40,7 @@ fn get_or_create_room(rooms: &Rooms, slug: &str) -> broadcast::Sender<String> {
 pub struct AppState {
     pub db:    Database,
     pub rooms: Rooms,
+    pub s3:    Client,
 }
 
 impl AppState {
@@ -63,6 +66,7 @@ pub struct CreateRequest {
     pub content:  String,
     pub language: Option<String>,
     pub images:   Option<Vec<ImageData>>,
+    pub files:    Option<Vec<FileData>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -77,9 +81,11 @@ pub struct ImageData {
 pub struct FileData {
     pub id:   String,   // uuid
     pub name: String,   // original filename
-    pub url:  String,   // Cloudinary secure_url (raw resource)
+    pub url:  String,   // S3 object URL (public)
     pub size: u64,      // bytes
     pub mime: String,   // e.g. "application/zip"
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +197,86 @@ async fn slug_exists(col: &Collection<SnippetRow>, slug: &str) -> Result<bool, A
         > 0)
 }
 
+fn s3_bucket_name() -> String {
+    std::env::var("S3_BUCKET").unwrap_or_else(|_| "codeshare-devs".into())
+}
+
+fn s3_region() -> String {
+    std::env::var("AWS_REGION").unwrap_or_else(|_| "ap-south-1".into())
+}
+
+fn s3_file_url(key: &str) -> String {
+    let bucket = s3_bucket_name();
+    if s3_region() == "us-east-1" {
+        format!("https://{bucket}.s3.amazonaws.com/{key}")
+    } else {
+        format!("https://{bucket}.s3.{}.amazonaws.com/{key}", s3_region())
+    }
+}
+
+async fn put_s3(s3: &Client, key: &str, data: &[u8], content_type: &str) -> Result<String, AppError> {
+    let bucket = s3_bucket_name();
+    let result = s3
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(data.to_vec().into())
+        .content_type(content_type)
+        .acl(ObjectCannedAcl::PublicRead)
+        .send()
+        .await;
+    match result {
+        Ok(_) => Ok(s3_file_url(key)),
+        Err(_) => {
+            // Bucket policy may govern public access instead of ACLs — retry without ACL.
+            let result = s3
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(data.to_vec().into())
+                .content_type(content_type)
+                .send()
+                .await;
+            match result {
+                Ok(_) => Ok(s3_file_url(key)),
+                Err(e) => {
+                    tracing::error!("S3 put_object failed for key {key}: {e}");
+                    Err(AppError::Internal(format!("S3 upload failed: {e}")))
+                }
+            }
+        }
+    }
+}
+
+fn s3_key_from_url(url: &str) -> Result<String, AppError> {
+    let marker = "amazonaws.com/";
+    let pos = url.find(marker).ok_or_else(|| AppError::BadRequest(format!("invalid S3 URL: {url}")))?;
+    Ok(url[pos + marker.len()..].to_string())
+}
+
+async fn get_s3_object(
+    s3: &Client,
+    url: &str,
+) -> Result<(Vec<u8>, Option<String>), AppError> {
+    let bucket = s3_bucket_name();
+    let key = s3_key_from_url(url)?;
+    let mut output = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(&key)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("S3 get_object failed for key {key}: {e}")))?;
+    let content_type = output.content_type().map(|s| s.to_string());
+    let mut bytes = Vec::new();
+    let mut stream = output.body;
+    while let Some(item) = stream.next().await {
+        let chunk = item.map_err(|e| AppError::Internal(format!("S3 read error: {e}")))?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, content_type))
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn health() -> impl IntoResponse {
@@ -238,7 +324,7 @@ async fn create_snippet(
         content:    req.content,
         language:   req.language.unwrap_or_else(|| "javascript".into()),
         images:     req.images.unwrap_or_default(),
-        files:      vec![],
+        files:      req.files.unwrap_or_default(),
         created_at: Utc::now(),
         expires_at: never(),
     };
@@ -270,6 +356,7 @@ struct PatchReq {
     content:  Option<String>,
     language: Option<String>,
     images:   Option<Vec<ImageData>>,
+    files:    Option<Vec<FileData>>,
 }
 
 async fn patch_snippet(
@@ -289,7 +376,12 @@ async fn patch_snippet(
     }
     if let Some(i) = req.images {
         let b = to_bson(&i).unwrap();
-        col.update_one(filter, doc! { "$set": { "images": b } }, None)
+        col.update_one(filter.clone(), doc! { "$set": { "images": b } }, None)
+            .await.map_err(AppError::Db)?;
+    }
+    if let Some(f) = req.files {
+        let b = to_bson(&f).unwrap();
+        col.update_one(filter, doc! { "$set": { "files": b } }, None)
             .await.map_err(AppError::Db)?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -303,46 +395,39 @@ async fn delete_snippet(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ── Upload a file (any type) to Cloudinary as a raw resource ──────────────────
-async fn upload_file(mut multipart: Multipart) -> Result<Json<FileData>, AppError> {
-    let cloud_name    = std::env::var("CLOUDINARY_CLOUD_NAME").unwrap();
-    let upload_preset = std::env::var("CLOUDINARY_UPLOAD_PRESET").unwrap();
+// ── Upload a file (any type) to S3 ────────────────────────────────────────────
+async fn upload_file(
+    State(s): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<FileData>, AppError> {
+    let field = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("upload error: {e}")))?
+        .ok_or_else(|| AppError::BadRequest("No file provided".into()))?;
 
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let original_name = field
-            .file_name()
-            .unwrap_or("file")
-            .to_string();
-        let mime_type = field
-            .content_type()
-            .unwrap_or("application/octet-stream")
-            .to_string();
+    let original_name = field.file_name().unwrap_or("file").to_string();
+    let mime_type = field
+        .content_type()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let data = field.bytes().await.map_err(|e| AppError::BadRequest(format!("read error: {e}")))?.to_vec();
+    let size = data.len() as u64;
 
-        let data = field.bytes().await.unwrap();
-        let size = data.len() as u64;
+    let uid = uuid::Uuid::new_v4().to_string();
+    let safe_name = original_name.rsplit('/').next().unwrap_or("file").to_string();
+    let key = format!("files/{uid}/{}", safe_name.replace(' ', "_"));
 
-        let form = reqwest::multipart::Form::new()
-            .part("file", reqwest::multipart::Part::bytes(data.to_vec())
-                .file_name(original_name.clone()))
-            .text("upload_preset", upload_preset)
-            .text("resource_type", "raw");
+    let url = put_s3(&s.s3, &key, &data, &mime_type).await?;
 
-        let url = format!(
-            "https://api.cloudinary.com/v1_1/{}/raw/upload",
-            cloud_name
-        );
-        let res  = reqwest::Client::new().post(url).multipart(form).send().await.unwrap();
-        let json: serde_json::Value = res.json().await.unwrap();
-
-        return Ok(Json(FileData {
-            id:   uuid::Uuid::new_v4().to_string(),
-            name: original_name,
-            url:  json["secure_url"].as_str().unwrap().to_string(),
-            size,
-            mime: mime_type,
-        }));
-    }
-    Err(AppError::BadRequest("No file provided".into()))
+    Ok(Json(FileData {
+        id:     uuid::Uuid::new_v4().to_string(),
+        name:   original_name,
+        url,
+        size,
+        mime: mime_type,
+        folder: None,
+    }))
 }
 
 // ── Download all files in a room as a ZIP ─────────────────────────────────────
@@ -366,17 +451,8 @@ async fn download_zip(
     let options = FileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    let http = reqwest::Client::new();
-
     for file in &row.files {
-        let bytes = http
-            .get(&file.url)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("fetch failed: {e}")))?
-            .bytes()
-            .await
-            .map_err(|e| AppError::Internal(format!("read failed: {e}")))?;
+        let (bytes, _content_type) = get_s3_object(&s.s3, &file.url).await?;
 
         zip.start_file(&file.name, options)
             .map_err(|e| AppError::Internal(format!("zip error: {e}")))?;
@@ -419,24 +495,29 @@ async fn proxy_file(
         .find(|f| f.id == file_id)
         .ok_or_else(|| AppError::NotFound("File not found".into()))?;
 
-    // Fetch the actual bytes from Cloudinary server-side
-    let bytes = reqwest::Client::new()
-        .get(&file.url)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("fetch failed: {e}")))?
-        .bytes()
-        .await
-        .map_err(|e| AppError::Internal(format!("read body failed: {e}")))?;
+    // Fetch the actual bytes from S3 using backend credentials (private-bucket safe)
+    let (bytes, _content_type) = get_s3_object(&s.s3, &file.url).await?;
 
     // Encode filename for Content-Disposition (handles spaces, unicode, etc.)
     let encoded_name = urlencoding::encode(&file.name);
-    let disposition  = format!(
-        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
-        file.name.replace('"', "\\\""),
-        encoded_name,
-    );
-
+    let inline = file.mime.starts_with("image/")
+        || file.mime.starts_with("video/")
+        || file.mime.starts_with("audio/")
+        || file.mime == "application/pdf"
+        || file.mime.starts_with("text/");
+    let disposition = if inline {
+        format!(
+            "inline; filename=\"{}\"; filename*=UTF-8''{}",
+            file.name.replace('"', "\\\""),
+            encoded_name,
+        )
+    } else {
+        format!(
+            "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+            file.name.replace('"', "\\\""),
+            encoded_name,
+        )
+    };
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE,        file.mime)
@@ -448,27 +529,68 @@ async fn proxy_file(
         .unwrap())
 }
 
-// ── Image upload ──────────────────────────────────────────────────────────────
-async fn upload_image(mut multipart: Multipart) -> Result<Json<ImageData>, AppError> {
-    let cloud_name    = std::env::var("CLOUDINARY_CLOUD_NAME").unwrap();
-    let upload_preset = std::env::var("CLOUDINARY_UPLOAD_PRESET").unwrap();
+// ── Proxy an image (served via S3 GetObject with backend credentials) ─────────
+async fn proxy_image(
+    State(s): State<Arc<AppState>>,
+    Path((slug, image_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let row = s.col()
+        .find_one(doc! { "slug": &slug }, None)
+        .await
+        .map_err(AppError::Db)?
+        .ok_or_else(|| AppError::NotFound("Room not found".into()))?;
 
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let data = field.bytes().await.unwrap();
-        let form = reqwest::multipart::Form::new()
-            .part("file", reqwest::multipart::Part::bytes(data.to_vec()))
-            .text("upload_preset", upload_preset);
-        let url  = format!("https://api.cloudinary.com/v1_1/{}/image/upload", cloud_name);
-        let res  = reqwest::Client::new().post(url).multipart(form).send().await.unwrap();
-        let json: serde_json::Value = res.json().await.unwrap();
-        return Ok(Json(ImageData {
-            id:     uuid::Uuid::new_v4().to_string(),
-            url:    json["secure_url"].as_str().unwrap().to_string(),
-            width:  json["width"].as_u64().unwrap() as u32,
-            height: json["height"].as_u64().unwrap() as u32,
-        }));
-    }
-    Err(AppError::BadRequest("No file".into()))
+    let image = row
+        .images
+        .into_iter()
+        .find(|i| i.id == image_id)
+        .ok_or_else(|| AppError::NotFound("Image not found".into()))?;
+
+    let (bytes, content_type) = get_s3_object(&s.s3, &image.url).await?;
+
+    let encoded_name = urlencoding::encode(&image.id);
+    let disposition = format!(
+        "inline; filename=\"{image_id}\"; filename*=UTF-8''{encoded_name}",
+        image_id = image_id,
+        encoded_name = encoded_name,
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type.unwrap_or_else(|| "image/jpeg".to_string()))
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header("Access-Control-Allow-Origin", "*")
+        .body(Body::from(bytes))
+        .unwrap())
+}
+
+// ── Image upload ──────────────────────────────────────────────────────────────
+async fn upload_image(
+    State(s): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<ImageData>, AppError> {
+    let field = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("upload error: {e}")))?
+        .ok_or_else(|| AppError::BadRequest("No file".into()))?;
+
+    let mime_type = field.content_type().unwrap_or("image/jpeg").to_string();
+    let safe_name = field.file_name().unwrap_or("image").to_string();
+    let data = field.bytes().await.map_err(|e| AppError::BadRequest(format!("read error: {e}")))?.to_vec();
+
+    let uid = uuid::Uuid::new_v4().to_string();
+    let key = format!("images/{uid}/{}", safe_name.replace(' ', "_"));
+
+    let url = put_s3(&s.s3, &key, &data, &mime_type).await?;
+
+    Ok(Json(ImageData {
+        id:     uuid::Uuid::new_v4().to_string(),
+        url,
+        width:  0,
+        height: 0,
+    }))
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -588,7 +710,7 @@ async fn main() {
         .init();
 
     let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3004".into())
+        .unwrap_or_else(|_| "3001".into())
         .parse()
         .unwrap();
 
@@ -598,7 +720,10 @@ async fn main() {
     let db = db::get_database().await;
     info!("db ready");
 
-    let state = Arc::new(AppState { db, rooms: Arc::new(DashMap::new()) });
+    let aws_cfg = aws_config::load_from_env().await;
+    let s3 = Client::new(&aws_cfg);
+
+    let state = Arc::new(AppState { db, rooms: Arc::new(DashMap::new()), s3 });
 
 
     let cors = CorsLayer::new()
@@ -635,6 +760,7 @@ async fn main() {
         )
         .route("/api/snippets/:slug/download-zip",          get(download_zip))
         .route("/api/snippets/:slug/files/:file_id",        get(proxy_file))
+        .route("/api/snippets/:slug/images/:image_id",      get(proxy_image))
         .route("/ws/:slug",                        get(ws_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())

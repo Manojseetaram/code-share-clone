@@ -26,6 +26,6 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /app/target/release/backend .
 
-EXPOSE 3004
+EXPOSE 3001
 
 CMD ["./backend"]

@@ -28,3 +28,5 @@ dashmap = "5"
 futures-util = "0.3"
 urlencoding = "2"
 reqwest = { version = "0.11", features = ["multipart", "json"] }
+aws-sdk-s3 = "1.156.0"
+aws-config = "1.13.0"

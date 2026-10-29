@@ -7,12 +7,16 @@ services:
       dockerfile: Dockerfile
     restart: always
     environment:
-      # Postgres — matches the db service defined below
-      DATABASE_URL: postgres://codeshare:codeshare@db:5432/codeshare
+      # MongoDB — matches the db service defined below
+      DATABASE_URL: mongodb://codeshare:codeshare@mongo:27017/codeshare
+      MONGODB_DB: codeshare
       PORT: 3001
       FRONTEND_URL: https://yourdomain.com   # ← change this
-      CLOUDINARY_CLOUD_NAME: your_cloud_name  # ← change this
-      CLOUDINARY_UPLOAD_PRESET: your_preset   # ← change this
+      # AWS S3
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      S3_BUCKET: ${S3_BUCKET:-codeshare-devs}
     depends_on:
       db:
         condition: service_healthy
@@ -31,22 +35,22 @@ services:
       - backend
 
   db:
-    image: postgres:16-alpine
+    image: mongo:7
     restart: always
     environment:
-      POSTGRES_USER: codeshare
-      POSTGRES_PASSWORD: codeshare
-      POSTGRES_DB: codeshare
+      MONGO_INITDB_DATABASE: codeshare
+      MONGO_INITDB_USER: codeshare
+      MONGO_INITDB_PASSWORD: codeshare
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - db_data:/data/db
     # Only expose internally; remove the ports block for production
     expose:
-      - "5432"
+      - "27017"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U codeshare"]
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 12
 
 volumes:
   db_data:

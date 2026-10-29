@@ -1,14 +1,14 @@
 import './App.css'
 import { useState, useRef, useEffect, useCallback } from 'react'
 import Editor from '@monaco-editor/react'
-import type * as Monaco from 'monaco-editor'
+import * as Monaco from 'monaco-editor'
 import { useParams, useNavigate } from 'react-router-dom'
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const BACKEND    = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? ''
 const WS_BACKEND = BACKEND
   ? BACKEND.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
-  : 'ws://localhost:3004'
+  : 'ws://localhost:3001'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface PastedImage { id: string; url: string; width: number; height: number }
@@ -16,7 +16,7 @@ interface BackendImage { id: string; url: string; width: number; height: number 
 const toBackendImage   = (img: PastedImage): BackendImage => ({ ...img })
 const fromBackendImage = (img: BackendImage): PastedImage => ({ ...img })
 
-interface SharedFile { id: string; name: string; url: string; size: number; mime: string }
+interface SharedFile { id: string; name: string; url: string; size: number; mime: string; folder?: string | null }
 
 function randomSlug() {
   return Math.random().toString(36).slice(2, 10)
@@ -128,15 +128,15 @@ function IconDownload() {
 }
 
 // ─── Image lightbox ───────────────────────────────────────────────────────────
-function ImageViewer({ img, onClose }: { img: PastedImage; onClose: () => void }) {
+function ImageViewer({ img, slug, onClose }: { img: PastedImage; slug?: string; onClose: () => void }) {
   useEffect(() => {
     const fn = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', fn)
     return () => window.removeEventListener('keydown', fn)
-  }, [onClose])
+  }, [onClose, slug])
   return (
     <div className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center" onClick={onClose}>
-      <img src={img.url} alt="full" className="max-w-[90vw] max-h-[90vh] object-contain rounded shadow-2xl" onClick={e => e.stopPropagation()} />
+      <img src={`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}/images/${encodeURIComponent(img.id)}`} alt="full" className="max-w-[90vw] max-h-[90vh] object-contain rounded shadow-2xl" onClick={e => e.stopPropagation()} />
       <button onClick={onClose} className="absolute top-4 right-4 text-white text-2xl w-9 h-9 flex items-center justify-center rounded-full bg-black/50 hover:bg-black/80">
         <IconX />
       </button>
@@ -146,21 +146,22 @@ function ImageViewer({ img, onClose }: { img: PastedImage; onClose: () => void }
 
 // ─── File strip ───────────────────────────────────────────────────────────────
 function FileStrip({
-  files, isDark, slug, onRemove, uploading
+  files, isDark, slug, onRemove, uploading, onOpen
 }: {
   files: SharedFile[]
   isDark: boolean
   slug: string
   onRemove: (id: string) => void
   uploading: boolean
+  onOpen: (f: SharedFile) => void
 }) {
   const [downloading, setDownloading] = useState(false)
 
-  // All downloads go through the backend proxy so Cloudinary CORS/Content-Disposition
+  // All downloads go through the backend proxy so S3 CORS/Content-Disposition
   // issues are avoided entirely. The backend fetches the bytes and streams them back
   // with proper headers.
   const proxyUrl = (fileId: string) =>
-    `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/files/${encodeURIComponent(fileId)}`
+    `${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}/files/${encodeURIComponent(fileId)}`
 
   const downloadSingle = async (f: SharedFile) => {
     const res  = await fetchWithRetry(proxyUrl(f.id))
@@ -177,7 +178,7 @@ function FileStrip({
   const downloadZip = async () => {
     setDownloading(true)
     try {
-      const res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}/download-zip`)
+      const res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}/download-zip`)
       if (!res.ok) throw new Error('failed')
       const blob = await res.blob()
       const url  = URL.createObjectURL(blob)
@@ -206,17 +207,29 @@ function FileStrip({
         {files.map(f => (
           <div
             key={f.id}
-            className={`group relative flex items-center gap-2 shrink-0 rounded px-2.5 py-1.5 text-xs border
+            onClick={() => onOpen(f)}
+            className={`group relative flex items-center gap-2 shrink-0 rounded px-2.5 py-1.5 text-xs border cursor-pointer
               ${isDark ? 'bg-[#1e1e1e] border-[#3c3c3c] text-gray-300' : 'bg-white border-gray-200 text-gray-700'}`}
           >
+            {f.folder && (
+              <span className={`text-[10px] px-1.5 py-0.5 rounded self-center ${isDark ? 'bg-[#3c3c3c] text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                {f.folder}
+              </span>
+            )}
+            {f.mime.startsWith('video/') ? (
+              <video src={proxyUrl(f.id)} controls className="h-14 rounded bg-black" />
+            ) : (
+            <>
             <span className="text-base leading-none">{fileIcon(f.mime)}</span>
             <div className="flex flex-col min-w-0 max-w-[120px]">
               <span className="truncate font-medium leading-tight">{f.name}</span>
               <span className={`text-[10px] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{formatBytes(f.size)}</span>
             </div>
-            {/* Individual download — via backend proxy, not direct Cloudinary URL */}
+            </>
+            )}
+            {/* Individual download — via backend proxy, not direct S3 URL */}
             <button
-              onClick={() => downloadSingle(f)}
+              onClick={(e) => { e.stopPropagation(); downloadSingle(f) }}
               className={`ml-1 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded
                 ${isDark ? 'text-blue-400 hover:text-blue-300' : 'text-blue-600 hover:text-blue-700'}`}
               title="Download"
@@ -225,7 +238,7 @@ function FileStrip({
             </button>
             {/* Remove */}
             <button
-              onClick={() => onRemove(f.id)}
+              onClick={(e) => { e.stopPropagation(); onRemove(f.id) }}
               className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
               title="Remove"
             >
@@ -266,6 +279,51 @@ function FileStrip({
   )
 }
 
+// ─── File viewer (video / pdf / text / image) ─────────────────────────────────
+function FileViewer({ file, slug, onClose }: { file: SharedFile; slug?: string; onClose: () => void }) {
+  const [text, setText] = useState<string | null>(null)
+  const proxyUrl = `${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}/files/${encodeURIComponent(file.id)}`
+
+  useEffect(() => {
+    const fn = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', fn)
+    return () => window.removeEventListener('keydown', fn)
+  }, [onClose])
+
+  useEffect(() => {
+    if (!file.mime.startsWith('text/')) return
+    let dead = false
+    fetch(proxyUrl)
+      .then(r => r.text())
+      .then(t => { if (!dead) setText(t) })
+      .catch(() => {})
+    return () => { dead = true }
+  }, [file, proxyUrl])
+
+  const isPlainFile = !file.mime.startsWith('video/') && !file.mime.startsWith('image/') && file.mime !== 'application/pdf' && !file.mime.startsWith('text/')
+
+  return (
+    <div className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center" onClick={onClose}>
+      <div className="bg-[#252526] rounded-lg p-3 max-w-[95vw] max-h-[90vh] overflow-auto" onClick={e => e.stopPropagation()}>
+        {file.mime.startsWith('video/') && <video src={proxyUrl} controls autoPlay className="max-w-[80vw] max-h-[70vh] rounded" />}
+        {file.mime.startsWith('image/') && <img src={file.url} alt={file.name} className="max-w-[80vw] max-h-[70vh] rounded" />}
+        {file.mime === 'application/pdf' && <iframe src={proxyUrl} title={file.name} className="w-[80vw] h-[70vh] rounded bg-white" />}
+        {file.mime.startsWith('text/') && (
+          text === null
+            ? <div className="text-gray-400 text-sm p-4">Loading…</div>
+            : <pre className="text-xs text-gray-200 whitespace-pre-wrap break-all max-h-[70vh] overflow-auto">{text}</pre>
+        )}
+        {isPlainFile && (
+          <a href={proxyUrl} download={file.name} className="text-blue-400 underline text-sm">Download file</a>
+        )}
+      </div>
+      <button onClick={onClose} className="absolute top-4 right-4 text-white text-2xl w-9 h-9 flex items-center justify-center rounded-full bg-black/50 hover:bg-black/80">
+        <IconX />
+      </button>
+    </div>
+  )
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const { slug } = useParams<{ slug?: string }>()
@@ -276,6 +334,7 @@ export default function App() {
   const [sharedFiles, setSharedFiles]     = useState<SharedFile[]>([])
   const [fileUploading, setFileUploading] = useState(false)
   const [viewerImage, setViewerImage]     = useState<PastedImage | null>(null)
+  const [viewerFile, setViewerFile]       = useState<SharedFile | null>(null)
   const [code, setCode]                   = useState('// Start typing or paste your code, image here AND ZIP FILE...\n\n')
   const [language, setLanguage]           = useState('javascript')
   const [viewers, setViewers]             = useState(1)
@@ -303,12 +362,12 @@ export default function App() {
     async function loadOrCreate() {
       try {
         // fetchWithRetry handles 502 cold-start responses from Render
-        let res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
+        let res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}`)
 
         // Show "waking up" message while retrying
         if (!res.ok && res.status !== 404) {
           setStatus('waking')
-          res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`, undefined, 6, 3000)
+          res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}`, undefined, 6, 3000)
         }
 
         if (res.status === 404) {
@@ -321,7 +380,7 @@ export default function App() {
               language: 'javascript',
             }),
           })
-          res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`)
+          res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}`)
         }
 
         if (!res.ok) throw new Error('failed')
@@ -376,7 +435,9 @@ export default function App() {
             setSharedFiles(p => p.find(f => f.id === msg.file.id) ? p : [...p, msg.file as SharedFile])
           else if (msg.type === 'broadcast_remove_file')
             setSharedFiles(p => p.filter(f => f.id !== msg.id))
-        } catch {}
+        } catch (err) {
+          console.warn('ws message error', err)
+        }
       }
     }
 
@@ -393,7 +454,7 @@ export default function App() {
       wsRef.current.send(JSON.stringify(msg))
   }, [])
 
-  // ── Upload a file to Cloudinary via backend, then broadcast via WS ──────────
+  // ── Upload a file to S3 via backend, then broadcast via WS ───────────────────
   const uploadFile = useCallback(async (file: File) => {
     setFileUploading(true)
     try {
@@ -401,12 +462,16 @@ export default function App() {
       form.append('file', file)
       // fetchWithRetry here handles cold-start 502s on upload too
       const res = await fetchWithRetry(`${BACKEND}/api/upload-file`, { method: 'POST', body: form })
-      if (!res.ok) throw new Error('upload failed')
+      if (!res.ok) {
+        let msg = 'upload failed'
+        try { const j = await res.json(); msg = (j as { error?: string }).error ?? msg } catch { void 0 }
+        throw new Error(msg)
+      }
       const fileData: SharedFile = await res.json()
       setSharedFiles(prev => prev.find(f => f.id === fileData.id) ? prev : [...prev, fileData])
       wsSend({ type: 'file', file: fileData })
-    } catch {
-      alert('File upload failed. The server may be waking up — please try again in a moment.')
+    } catch (err) {
+      alert(`File upload failed: ${err instanceof Error ? err.message : 'unknown error'}`)
     } finally {
       setFileUploading(false)
     }
@@ -415,6 +480,46 @@ export default function App() {
   const removeFile = useCallback((id: string) => {
     setSharedFiles(p => p.filter(f => f.id !== id))
     wsSend({ type: 'remove_file', id })
+  }, [wsSend])
+
+
+  const processImage = useCallback(async (file: File, slug: string) => {
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const res = await fetchWithRetry(`${BACKEND}/api/upload`, { method: 'POST', body: form })
+      if (!res.ok) {
+        let msg = 'upload failed'
+        try { const j = await res.json(); msg = (j as { error?: string }).error ?? msg } catch { void 0 }
+        throw new Error(msg)
+      }
+      const image: BackendImage = await res.json()
+      // Decode dimensions through the backend proxy (S3 bucket may be private)
+      const proxyImgUrl = `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/images/${encodeURIComponent(image.id)}`
+      let width = 0
+      let height = 0
+      try {
+        width = await new Promise<number>((resolve, reject) => {
+          const img = new Image()
+          img.onload = () => resolve(img.naturalWidth)
+          img.onerror = () => reject(new Error('decode failed'))
+          img.src = proxyImgUrl
+        })
+        height = await new Promise<number>((resolve, reject) => {
+          const img = new Image()
+          img.onload = () => resolve(img.naturalHeight)
+          img.onerror = () => reject(new Error('decode failed'))
+          img.src = proxyImgUrl
+        })
+      } catch {
+        // Image is already stored on S3 — keep 0x0 dims if preview can't decode
+      }
+      const newImg: PastedImage = { id: image.id, url: image.url, width, height }
+      setPastedImages(prev => [...prev, newImg])
+      wsSend({ type: 'image', image: toBackendImage(newImg) })
+    } catch (err) {
+      alert(`Image upload failed: ${err instanceof Error ? err.message : 'unknown error'}`)
+    }
   }, [wsSend])
 
   // ── Drag-and-drop files onto the whole page ───────────────────────────────
@@ -433,7 +538,7 @@ export default function App() {
       const items = Array.from(e.dataTransfer?.files ?? [])
       for (const file of items) {
         if (file.type.startsWith('image/')) {
-          processImage(file)
+processImage(file, slug ?? '')
         } else {
           await uploadFile(file)
         }
@@ -447,26 +552,7 @@ export default function App() {
       document.removeEventListener('dragleave', onDragLeave)
       document.removeEventListener('drop',      onDrop)
     }
-  }, [uploadFile])
-
-  const processImage = useCallback((file: File) => {
-    const reader = new FileReader()
-    reader.onload = ev => {
-      const url = ev.target?.result as string
-      const image = new Image()
-      image.onload = () => {
-        const newImg: PastedImage = {
-          id: crypto.randomUUID(), url,
-          width: image.naturalWidth, height: image.naturalHeight,
-        }
-        setPastedImages(prev => [...prev, newImg])
-        wsSend({ type: 'image', image: toBackendImage(newImg) })
-      }
-      image.src = url
-    }
-    reader.readAsDataURL(file)
-  }, [wsSend])
-
+}, [uploadFile, processImage, slug])
   const handleEditorMount = useCallback((editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof Monaco) => {
     editorRef.current = editor; monacoRef.current = monaco
   }, [])
@@ -480,12 +566,11 @@ export default function App() {
       if (!imageItem) return
       e.preventDefault(); e.stopPropagation()
       const file = imageItem.getAsFile()
-      if (file) processImage(file)
+if (file) processImage(file, slug ?? '')
     }
     document.addEventListener('paste', handler, true)
     return () => document.removeEventListener('paste', handler, true)
-  }, [processImage])
-
+}, [processImage, slug])
   const handleCodeChange = useCallback((val: string | undefined) => {
     if (isRemote.current) return
     const v = val ?? ''
@@ -507,6 +592,9 @@ export default function App() {
   }
 
   if (!slug) return null
+  const proxyImageUrl = (imageId: string) =>
+    `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/images/${encodeURIComponent(imageId)}`
+
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }} className={isDark ? 'bg-[#1e1e1e]' : 'bg-white'}>
@@ -545,7 +633,7 @@ export default function App() {
             onChange={async e => {
               const files = Array.from(e.target.files ?? [])
               for (const f of files) {
-                if (f.type.startsWith('image/')) processImage(f)
+                if (f.type.startsWith('image/')) processImage(f, slug)
                 else await uploadFile(f)
               }
               e.target.value = ''
@@ -634,9 +722,9 @@ export default function App() {
             acceptSuggestionOnEnter: 'off',
             tabCompletion: 'off',
             wordBasedSuggestions: 'off',
-            hover: { enabled: false },
+            hover: { enabled: 'off' },
             contextmenu: false,
-            lightbulb: { enabled: 'off' },
+            lightbulb: { enabled: Monaco.editor.ShowLightbulbIconMode.Off },
           }}
         />
       </div>
@@ -651,7 +739,7 @@ export default function App() {
             {pastedImages.map(img => (
               <div key={img.id} className="relative group shrink-0 cursor-pointer" onClick={() => setViewerImage(img)}>
                 <img
-                  src={img.url} alt="pasted"
+                  src={proxyImageUrl(img.id)} alt="pasted"
                   className="h-14 w-auto rounded border object-cover"
                   style={{ borderColor: isDark ? '#3c3c3c' : '#e5e7eb' }}
                 />
@@ -678,6 +766,7 @@ export default function App() {
           slug={slug}
           onRemove={removeFile}
           uploading={fileUploading}
+          onOpen={setViewerFile}
         />
       )}
 
@@ -704,7 +793,8 @@ export default function App() {
         )}
       </div>
 
-      {viewerImage && <ImageViewer img={viewerImage} onClose={() => setViewerImage(null)} />}
+      {viewerImage && <ImageViewer img={viewerImage} slug={slug} onClose={() => setViewerImage(null)} />}
+      {viewerFile && <FileViewer file={viewerFile} slug={slug} onClose={() => setViewerFile(null)} />}
     </div>
   )
 }
