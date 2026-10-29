@@ -1,14 +1,15 @@
 import './App.css'
 import { useState, useRef, useEffect, useCallback } from 'react'
-import Editor from '@monaco-editor/react'
-import * as Monaco from 'monaco-editor'
+import Editor, { type OnMount } from '@monaco-editor/react'
 import { useParams, useNavigate } from 'react-router-dom'
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const BACKEND    = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? ''
+const BACKEND    = ((import.meta.env.VITE_BACKEND_URL as string | undefined) ?? '').replace(/\/+$/, '')
 const WS_BACKEND = BACKEND
   ? BACKEND.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
   : 'ws://localhost:3001'
+
+const DEFAULT_CODE = '// Start typing or paste your code, image or any file here...\n\n'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface PastedImage { id: string; url: string; width: number; height: number }
@@ -18,8 +19,37 @@ const fromBackendImage = (img: BackendImage): PastedImage => ({ ...img })
 
 interface SharedFile { id: string; name: string; url: string; size: number; mime: string; folder?: string | null }
 
-function randomSlug() {
-  return Math.random().toString(36).slice(2, 10)
+interface SnippetData {
+  content: string
+  language: string
+  images?: BackendImage[]
+  files?: SharedFile[]
+}
+
+// ─── Slug helpers (MUST match the backend `sanitize` / `validate`) ────────────
+const RESERVED_SLUGS = ['api', 'admin', 'health', 'ws', 'new', 'static', 'assets']
+
+function normalizeSlug(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+function isValidSlug(slug: string): boolean {
+  return (
+    slug.length >= 3 &&
+    slug.length <= 60 &&
+    /^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(slug) &&
+    !RESERVED_SLUGS.includes(slug)
+  )
+}
+
+function randomSlug(): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
+  const bytes = new Uint8Array(8)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, b => alphabet[b % alphabet.length]).join('')
 }
 
 function formatBytes(bytes: number): string {
@@ -49,7 +79,6 @@ async function fetchWithRetry(
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, options)
-      // Retry on 502/503/504 (Render cold start / proxy errors)
       if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < retries) {
         await new Promise(r => setTimeout(r, delayMs * (attempt + 1)))
         continue
@@ -129,15 +158,20 @@ function IconDownload() {
 }
 
 // ─── Image lightbox ───────────────────────────────────────────────────────────
-function ImageViewer({ img, slug, onClose }: { img: PastedImage; slug?: string; onClose: () => void }) {
+function ImageViewer({ img, slug, onClose }: { img: PastedImage; slug: string; onClose: () => void }) {
   useEffect(() => {
     const fn = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', fn)
     return () => window.removeEventListener('keydown', fn)
-  }, [onClose, slug])
+  }, [onClose])
   return (
     <div className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center" onClick={onClose}>
-      <img src={`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}/images/${encodeURIComponent(img.id)}`} alt="full" className="max-w-[90vw] max-h-[90vh] object-contain rounded shadow-2xl" onClick={e => e.stopPropagation()} />
+      <img
+        src={`${BACKEND}/api/snippets/${encodeURIComponent(slug)}/images/${encodeURIComponent(img.id)}`}
+        alt="full"
+        className="max-w-[90vw] max-h-[90vh] object-contain rounded shadow-2xl"
+        onClick={e => e.stopPropagation()}
+      />
       <button onClick={onClose} className="absolute top-4 right-4 text-white text-2xl w-9 h-9 flex items-center justify-center rounded-full bg-black/50 hover:bg-black/80">
         <IconX />
       </button>
@@ -157,14 +191,11 @@ function FileStrip({
   progress: number | null
   onOpen: (f: SharedFile) => void
 }) {
-  const [downloading, setDownloading] = useState(false)
-
   const proxyUrl = (fileId: string) =>
-    `${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}/files/${encodeURIComponent(fileId)}`
+    `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/files/${encodeURIComponent(fileId)}`
 
-  // The backend answers ?dl=1 with a redirect to a presigned S3 URL that has
-  // Content-Disposition: attachment, so the browser streams the download itself.
-  // No blob, no memory use, works for multi-GB files.
+  // Backend answers ?dl=1 with a redirect to a presigned S3 URL (attachment),
+  // so the browser streams the download itself — no memory use, any size.
   const downloadSingle = (f: SharedFile) => {
     const a = document.createElement('a')
     a.href = `${proxyUrl(f.id)}?dl=1`
@@ -174,35 +205,25 @@ function FileStrip({
     a.remove()
   }
 
-  const downloadZip = async () => {
-    setDownloading(true)
-    try {
-      const res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}/download-zip`)
-      if (!res.ok) throw new Error('failed')
-      const blob = await res.blob()
-      const url  = URL.createObjectURL(blob)
-      const a    = document.createElement('a')
-      a.href     = url
-      a.download = `${slug}.zip`
-      a.click()
-      URL.revokeObjectURL(url)
-    } catch {
-      alert('Download failed')
-    } finally {
-      setDownloading(false)
-    }
+  // The server responds with Content-Disposition: attachment, so a plain
+  // navigation streams the zip straight to disk.
+  const downloadZip = () => {
+    const a = document.createElement('a')
+    a.href = `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/download-zip`
+    a.download = `${slug}.zip`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
   }
 
   return (
     <div className={`shrink-0 border-t ${isDark ? 'border-[#3c3c3c] bg-[#252526]' : 'border-gray-200 bg-gray-50'}`}>
       <div className="flex items-center gap-2 px-4 py-2 overflow-x-auto">
 
-        {/* Label + count */}
         <span className={`text-xs shrink-0 font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
           Files ({files.length})
         </span>
 
-        {/* File cards */}
         {files.map(f => (
           <div
             key={f.id}
@@ -224,15 +245,14 @@ function FileStrip({
                 className="h-14 rounded bg-black"
               />
             ) : (
-            <>
-            <span className="text-base leading-none">{fileIcon(f.mime)}</span>
-            <div className="flex flex-col min-w-0 max-w-[120px]">
-              <span className="truncate font-medium leading-tight">{f.name}</span>
-              <span className={`text-[10px] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{formatBytes(f.size)}</span>
-            </div>
-            </>
+              <>
+                <span className="text-base leading-none">{fileIcon(f.mime)}</span>
+                <div className="flex flex-col min-w-0 max-w-[120px]">
+                  <span className="truncate font-medium leading-tight">{f.name}</span>
+                  <span className={`text-[10px] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{formatBytes(f.size)}</span>
+                </div>
+              </>
             )}
-            {/* Individual download */}
             <button
               onClick={(e) => { e.stopPropagation(); downloadSingle(f) }}
               className={`ml-1 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded
@@ -241,7 +261,6 @@ function FileStrip({
             >
               <IconDownload />
             </button>
-            {/* Remove */}
             <button
               onClick={(e) => { e.stopPropagation(); onRemove(f.id) }}
               className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
@@ -252,7 +271,6 @@ function FileStrip({
           </div>
         ))}
 
-        {/* Upload progress */}
         {uploading && (
           <div className={`flex items-center gap-2 text-xs px-2 shrink-0 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
             <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -267,21 +285,14 @@ function FileStrip({
           </div>
         )}
 
-        {/* Download all as ZIP */}
         {files.length > 1 && (
           <button
             onClick={downloadZip}
-            disabled={downloading}
             className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium transition-colors ml-auto
-              ${downloading
-                ? 'opacity-50 cursor-not-allowed bg-gray-600 text-white'
-                : isDark
-                  ? 'bg-[#3c3c3c] hover:bg-[#4a4a4a] text-gray-200'
-                  : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
-              }`}
+              ${isDark ? 'bg-[#3c3c3c] hover:bg-[#4a4a4a] text-gray-200' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`}
           >
             <IconDownload />
-            {downloading ? 'Zipping…' : 'Download all (.zip)'}
+            Download all (.zip)
           </button>
         )}
       </div>
@@ -290,9 +301,9 @@ function FileStrip({
 }
 
 // ─── File viewer (video / pdf / text / image) ─────────────────────────────────
-function FileViewer({ file, slug, onClose }: { file: SharedFile; slug?: string; onClose: () => void }) {
+function FileViewer({ file, slug, onClose }: { file: SharedFile; slug: string; onClose: () => void }) {
   const [text, setText] = useState<string | null>(null)
-  const proxyUrl = `${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}/files/${encodeURIComponent(file.id)}`
+  const proxyUrl = `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/files/${encodeURIComponent(file.id)}`
 
   useEffect(() => {
     const fn = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -306,7 +317,7 @@ function FileViewer({ file, slug, onClose }: { file: SharedFile; slug?: string; 
     fetch(proxyUrl)
       .then(r => r.text())
       .then(t => { if (!dead) setText(t) })
-      .catch(() => {})
+      .catch(() => { if (!dead) setText('Could not load file.') })
     return () => { dead = true }
   }, [file, proxyUrl])
 
@@ -342,93 +353,129 @@ function FileViewer({ file, slug, onClose }: { file: SharedFile; slug?: string; 
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const { slug } = useParams<{ slug?: string }>()
-  const navigate  = useNavigate()
+  const { slug: rawSlug } = useParams<{ slug?: string }>()
+  const navigate = useNavigate()
 
-  const [theme, setTheme]                 = useState<'dark' | 'light'>('dark')
-  const [pastedImages, setPastedImages]   = useState<PastedImage[]>([])
-  const [sharedFiles, setSharedFiles]     = useState<SharedFile[]>([])
-  const [fileUploading, setFileUploading] = useState(false)
+  // Canonical slug: anything the backend would rewrite is redirected first,
+  // so frontend and backend always agree on the room name.
+  const normalized = rawSlug ? normalizeSlug(rawSlug) : ''
+  const slugOk     = isValidSlug(normalized)
+  const slug       = rawSlug && slugOk && normalized === rawSlug ? rawSlug : undefined
+
+  const [theme, setTheme]                   = useState<'dark' | 'light'>('dark')
+  const [pastedImages, setPastedImages]     = useState<PastedImage[]>([])
+  const [sharedFiles, setSharedFiles]       = useState<SharedFile[]>([])
+  const [uploadsActive, setUploadsActive]   = useState(0)
   const [uploadProgress, setUploadProgress] = useState<number | null>(null)
-  const [viewerImage, setViewerImage]     = useState<PastedImage | null>(null)
-  const [viewerFile, setViewerFile]       = useState<SharedFile | null>(null)
-  const [code, setCode]                   = useState('// Start typing or paste your code, image here AND ZIP FILE...\n\n')
-  const [language, setLanguage]           = useState('javascript')
-  const [viewers, setViewers]             = useState(1)
-  const [wsReady, setWsReady]             = useState(false)
-  const [status, setStatus]               = useState<'loading' | 'ready' | 'error' | 'waking'>('loading')
+  const [viewerImage, setViewerImage]       = useState<PastedImage | null>(null)
+  const [viewerFile, setViewerFile]         = useState<SharedFile | null>(null)
+  const [code, setCode]                     = useState(DEFAULT_CODE)
+  const [language, setLanguage]             = useState('javascript')
+  const [viewers, setViewers]               = useState(1)
+  const [wsReady, setWsReady]               = useState(false)
+  const [status, setStatus]                 = useState<'loading' | 'ready' | 'error' | 'waking'>('loading')
   const [isDraggingFile, setIsDraggingFile] = useState(false)
+  const [copied, setCopied]                 = useState(false)
 
-  const editorRef    = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
-  const monacoRef    = useRef<typeof Monaco | null>(null)
   const wsRef        = useRef<WebSocket | null>(null)
   const isRemote     = useRef(false)
   const sendTimer    = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const isDark       = theme === 'dark'
+  const fileUploading = uploadsActive > 0
 
+  // ── Redirect to a canonical / valid slug ────────────────────────────────────
   useEffect(() => {
-    if (!slug) navigate(`/${randomSlug()}`, { replace: true })
-  }, [slug, navigate])
+    if (!rawSlug || !slugOk) navigate(`/${randomSlug()}`, { replace: true })
+    else if (normalized !== rawSlug) navigate(`/${normalized}`, { replace: true })
+  }, [rawSlug, slugOk, normalized, navigate])
 
+  // ── Apply a snapshot from the server ────────────────────────────────────────
+  const applySnippet = useCallback((data: SnippetData) => {
+    isRemote.current = true
+    setCode(data.content)
+    setLanguage(data.language)
+    setPastedImages(Array.isArray(data.images) ? data.images.map(fromBackendImage) : [])
+    setSharedFiles(Array.isArray(data.files) ? data.files : [])
+    setTimeout(() => { isRemote.current = false }, 50)
+  }, [])
+
+  // ── Load (or create) the room ───────────────────────────────────────────────
   useEffect(() => {
     if (!slug) return
+    let cancelled = false
+
+    // reset everything from the previous room
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setStatus('loading')
+    setCode(DEFAULT_CODE)
+    setLanguage('javascript')
+    setPastedImages([])
+    setSharedFiles([])
+    setViewerImage(null)
+    setViewerFile(null)
+    if (sendTimer.current) clearTimeout(sendTimer.current)
+
+    const url = `${BACKEND}/api/snippets/${encodeURIComponent(slug)}`
 
     async function loadOrCreate() {
       try {
-        // fetchWithRetry handles 502 cold-start responses from Render
-        let res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}`)
+        let res = await fetchWithRetry(url)
 
-        // Show "waking up" message while retrying
         if (!res.ok && res.status !== 404) {
+          if (cancelled) return
           setStatus('waking')
-          res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}`, undefined, 6, 3000)
+          res = await fetchWithRetry(url, undefined, 6, 3000)
         }
 
         if (res.status === 404) {
           await fetchWithRetry(`${BACKEND}/api/snippets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              slug,
-              content: '// Start typing or paste your code or image here...\n\n',
-              language: 'javascript',
-            }),
+            body: JSON.stringify({ slug, content: DEFAULT_CODE, language: 'javascript' }),
           })
-          res = await fetchWithRetry(`${BACKEND}/api/snippets/${encodeURIComponent(slug ?? '')}`)
+          res = await fetchWithRetry(url)
         }
 
         if (!res.ok) throw new Error('failed')
-
-        const data = await res.json()
-        isRemote.current = true
-        setCode(data.content)
-        setLanguage(data.language)
-        if (Array.isArray(data.images) && data.images.length > 0)
-          setPastedImages((data.images as BackendImage[]).map(fromBackendImage))
-        if (Array.isArray(data.files) && data.files.length > 0)
-          setSharedFiles(data.files as SharedFile[])
-        setTimeout(() => { isRemote.current = false }, 50)
+        const data = (await res.json()) as SnippetData
+        if (cancelled) return
+        applySnippet(data)
         setStatus('ready')
       } catch {
-        setStatus('error')
+        if (!cancelled) setStatus('error')
       }
     }
 
     loadOrCreate()
-  }, [slug])
+    return () => { cancelled = true }
+  }, [slug, applySnippet])
 
+  // ── WebSocket with auto-reconnect + resync ──────────────────────────────────
   useEffect(() => {
     if (!slug) return
     let dead = false
+    let hasOpened = false
+
+    async function resync() {
+      try {
+        const res = await fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug as string)}`)
+        if (res.ok && !dead) applySnippet((await res.json()) as SnippetData)
+      } catch { /* ignore, next reconnect will retry */ }
+    }
 
     function connect() {
       if (dead) return
-      const ws = new WebSocket(`${WS_BACKEND}/ws/${slug}`)
+      const ws = new WebSocket(`${WS_BACKEND}/ws/${encodeURIComponent(slug as string)}`)
       wsRef.current = ws
-      ws.onopen  = () => { if (!dead) setWsReady(true) }
+
+      ws.onopen = () => {
+        if (dead) return
+        setWsReady(true)
+        if (hasOpened) resync() // we may have missed edits while offline
+        hasOpened = true
+      }
       ws.onerror = () => ws.close()
       ws.onclose = () => {
         setWsReady(false)
@@ -437,8 +484,8 @@ export default function App() {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)
-          if      (msg.type === 'connected')              setViewers(msg.viewers ?? 1)
-          else if (msg.type === 'viewers')                setViewers(msg.count ?? 1)
+          if      (msg.type === 'connected') setViewers(msg.viewers ?? 1)
+          else if (msg.type === 'viewers')   setViewers(msg.count ?? 1)
           else if (msg.type === 'broadcast_edit') {
             isRemote.current = true
             setCode(msg.content); setLanguage(msg.language)
@@ -462,23 +509,26 @@ export default function App() {
     return () => {
       dead = true
       if (reconnTimer.current) clearTimeout(reconnTimer.current)
-      wsRef.current?.close(); wsRef.current = null
+      wsRef.current?.close()
+      wsRef.current = null
     }
-  }, [slug])
+  }, [slug, applySnippet])
 
-  const wsSend = useCallback((msg: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN)
+  const wsSend = useCallback((msg: object): boolean => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg))
+      return true
+    }
+    return false
   }, [])
 
-  // ── Upload a file straight to S3 via a presigned URL, then broadcast via WS ──
+  // ── Upload a file straight to S3 via a presigned URL, then broadcast via WS ─
   const uploadFile = useCallback(async (file: File) => {
-    setFileUploading(true)
+    setUploadsActive(n => n + 1)
     setUploadProgress(0)
     try {
       const mime = file.type || 'application/octet-stream'
 
-      // 1. ask the backend for a presigned PUT URL (tiny JSON request)
       const pres = await fetchWithRetry(`${BACKEND}/api/presign-upload`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -492,7 +542,6 @@ export default function App() {
       const { upload_url, file: fileData } =
         await pres.json() as { upload_url: string; file: SharedFile }
 
-      // 2. PUT the bytes directly to S3 (XHR gives us upload progress)
       await new Promise<void>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         xhr.open('PUT', upload_url)
@@ -507,13 +556,12 @@ export default function App() {
         xhr.send(file)
       })
 
-      // 3. share the metadata with everyone in the room
       setSharedFiles(prev => prev.find(f => f.id === fileData.id) ? prev : [...prev, fileData])
       wsSend({ type: 'file', file: fileData })
     } catch (err) {
       alert(`File upload failed: ${err instanceof Error ? err.message : 'unknown error'}`)
     } finally {
-      setFileUploading(false)
+      setUploadsActive(n => Math.max(0, n - 1))
       setUploadProgress(null)
     }
   }, [wsSend])
@@ -523,7 +571,7 @@ export default function App() {
     wsSend({ type: 'remove_file', id })
   }, [wsSend])
 
-  const processImage = useCallback(async (file: File, slug: string) => {
+  const processImage = useCallback(async (file: File, roomSlug: string) => {
     try {
       const form = new FormData()
       form.append('file', file)
@@ -534,32 +582,35 @@ export default function App() {
         throw new Error(msg)
       }
       const image: BackendImage = await res.json()
-      // Decode dimensions through the backend proxy (S3 bucket may be private)
-      const proxyImgUrl = `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/images/${encodeURIComponent(image.id)}`
+
+      // Decode dimensions through the backend proxy (S3 bucket may be private).
+      // The image isn't attached to the room yet, so read dims from the local file instead.
       let width = 0
       let height = 0
       try {
+        const localUrl = URL.createObjectURL(file)
         const dims = await new Promise<{ w: number; h: number }>((resolve, reject) => {
           const img = new Image()
           img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight })
           img.onerror = () => reject(new Error('decode failed'))
-          img.src = proxyImgUrl
-        })
+          img.src = localUrl
+        }).finally(() => URL.revokeObjectURL(localUrl))
         width = dims.w
         height = dims.h
-      } catch {
-        // Image is already stored on S3 — keep 0x0 dims if preview can't decode
-      }
+      } catch { /* keep 0x0 */ }
+
       const newImg: PastedImage = { id: image.id, url: image.url, width, height }
       setPastedImages(prev => [...prev, newImg])
       wsSend({ type: 'image', image: toBackendImage(newImg) })
+      void roomSlug
     } catch (err) {
       alert(`Image upload failed: ${err instanceof Error ? err.message : 'unknown error'}`)
     }
   }, [wsSend])
 
-  // ── Drag-and-drop files onto the whole page ───────────────────────────────
+  // ── Drag-and-drop files onto the whole page ─────────────────────────────────
   useEffect(() => {
+    if (!slug) return
     const onDragOver = (e: DragEvent) => {
       if (!e.dataTransfer?.types.includes('Files')) return
       e.preventDefault()
@@ -573,11 +624,8 @@ export default function App() {
       setIsDraggingFile(false)
       const items = Array.from(e.dataTransfer?.files ?? [])
       for (const file of items) {
-        if (file.type.startsWith('image/')) {
-          processImage(file, slug ?? '')
-        } else {
-          await uploadFile(file)
-        }
+        if (file.type.startsWith('image/')) processImage(file, slug)
+        else await uploadFile(file)
       }
     }
     document.addEventListener('dragover',  onDragOver)
@@ -590,11 +638,15 @@ export default function App() {
     }
   }, [uploadFile, processImage, slug])
 
-  const handleEditorMount = useCallback((editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof Monaco) => {
-    editorRef.current = editor; monacoRef.current = monaco
+  const handleEditorMount: OnMount = useCallback((editor, monaco) => {
+    editor.updateOptions({
+      lightbulb: { enabled: monaco.editor.ShowLightbulbIconMode.Off },
+    })
   }, [])
 
+  // ── Paste images from clipboard into the editor ─────────────────────────────
   useEffect(() => {
+    if (!slug) return
     const handler = (e: ClipboardEvent) => {
       const active = document.activeElement
       if (!active) return
@@ -603,33 +655,50 @@ export default function App() {
       if (!imageItem) return
       e.preventDefault(); e.stopPropagation()
       const file = imageItem.getAsFile()
-      if (file) processImage(file, slug ?? '')
+      if (file) processImage(file, slug)
     }
     document.addEventListener('paste', handler, true)
     return () => document.removeEventListener('paste', handler, true)
   }, [processImage, slug])
+
+  // ── Send edits (WebSocket, with HTTP PATCH fallback when offline) ───────────
+  const sendEdit = useCallback((content: string, lang: string) => {
+    if (!slug) return
+    if (wsSend({ type: 'edit', content, language: lang })) return
+    fetch(`${BACKEND}/api/snippets/${encodeURIComponent(slug)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, language: lang }),
+    }).catch(() => { /* will resync on reconnect */ })
+  }, [wsSend, slug])
 
   const handleCodeChange = useCallback((val: string | undefined) => {
     if (isRemote.current) return
     const v = val ?? ''
     setCode(v)
     if (sendTimer.current) clearTimeout(sendTimer.current)
-    sendTimer.current = setTimeout(() => wsSend({ type: 'edit', content: v, language }), 300)
-  }, [wsSend, language])
+    sendTimer.current = setTimeout(() => sendEdit(v, language), 300)
+  }, [sendEdit, language])
+
+  useEffect(() => () => { if (sendTimer.current) clearTimeout(sendTimer.current) }, [])
 
   const removeImage = useCallback((id: string) => {
     setPastedImages(p => p.filter(i => i.id !== id))
     wsSend({ type: 'remove_image', id })
   }, [wsSend])
 
-  const [copied, setCopied] = useState(false)
-  const copyUrl = () => {
-    navigator.clipboard.writeText(window.location.href)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+  const copyUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.href)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      window.prompt('Copy this link:', window.location.href)
+    }
   }
 
   if (!slug) return null
+
   const proxyImageUrl = (imageId: string) =>
     `${BACKEND}/api/snippets/${encodeURIComponent(slug)}/images/${encodeURIComponent(imageId)}`
 
@@ -655,13 +724,11 @@ export default function App() {
         </button>
 
         <div className="flex items-center gap-2">
-          {/* Live dot */}
           <span
             title={wsReady ? 'Live' : 'Connecting…'}
             className={`w-2 h-2 rounded-full ${wsReady ? 'bg-green-500' : 'bg-yellow-400 animate-pulse'}`}
           />
 
-          {/* Upload file button */}
           <input
             ref={fileInputRef}
             type="file"
@@ -669,11 +736,11 @@ export default function App() {
             multiple
             onChange={async e => {
               const files = Array.from(e.target.files ?? [])
+              e.target.value = ''
               for (const f of files) {
                 if (f.type.startsWith('image/')) processImage(f, slug)
                 else await uploadFile(f)
               }
-              e.target.value = ''
             }}
           />
           <button
@@ -686,7 +753,6 @@ export default function App() {
             <span>Upload</span>
           </button>
 
-          {/* Theme toggle */}
           <button
             onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
             title={isDark ? 'Switch to light' : 'Switch to dark'}
@@ -695,7 +761,6 @@ export default function App() {
             {isDark ? <IconSun /> : <IconMoon />}
           </button>
 
-          {/* Share button */}
           <button
             onClick={copyUrl}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium transition-colors ${copied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}
@@ -721,8 +786,9 @@ export default function App() {
         </div>
       )}
       {status === 'error' && (
-        <div className="bg-red-900/40 border-b border-red-800 text-red-300 text-xs px-5 py-2">
-          Could not connect to server. Check your internet connection.
+        <div className="bg-red-900/40 border-b border-red-800 text-red-300 text-xs px-5 py-2 flex items-center gap-3">
+          <span>Could not connect to server. Check your internet connection.</span>
+          <button onClick={() => window.location.reload()} className="underline">Retry</button>
         </div>
       )}
 
@@ -759,9 +825,8 @@ export default function App() {
             acceptSuggestionOnEnter: 'off',
             tabCompletion: 'off',
             wordBasedSuggestions: 'off',
-            hover: { enabled: 'off' },
+            hover: { enabled: false },
             contextmenu: false,
-            lightbulb: { enabled: Monaco.editor.ShowLightbulbIconMode.Off },
           }}
         />
       </div>
@@ -780,9 +845,11 @@ export default function App() {
                   className="h-14 w-auto rounded border object-cover"
                   style={{ borderColor: isDark ? '#3c3c3c' : '#e5e7eb' }}
                 />
-                <span className={`absolute bottom-0.5 left-0.5 text-[9px] px-1 rounded pointer-events-none ${isDark ? 'bg-black/70 text-gray-300' : 'bg-black/50 text-white'}`}>
-                  {img.width}×{img.height}
-                </span>
+                {img.width > 0 && img.height > 0 && (
+                  <span className={`absolute bottom-0.5 left-0.5 text-[9px] px-1 rounded pointer-events-none ${isDark ? 'bg-black/70 text-gray-300' : 'bg-black/50 text-white'}`}>
+                    {img.width}×{img.height}
+                  </span>
+                )}
                 <button
                   onClick={e => { e.stopPropagation(); removeImage(img.id) }}
                   className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
@@ -796,7 +863,7 @@ export default function App() {
       )}
 
       {/* File strip */}
-      {(sharedFiles.length > 0 || fileUploading) && slug && (
+      {(sharedFiles.length > 0 || fileUploading) && (
         <FileStrip
           files={sharedFiles}
           isDark={isDark}

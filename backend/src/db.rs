@@ -3,17 +3,19 @@ use mongodb::{
     options::{ClientOptions, IndexOptions},
     Client, Database, IndexModel,
 };
+use std::time::Duration;
 use tracing::info;
 
 pub async fn get_database() -> Database {
-    let mongo_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set");
+    let mongo_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let mut opts = ClientOptions::parse(&mongo_url)
         .await
         .expect("Failed to parse MongoDB URL");
 
     opts.app_name = Some("backend".into());
+    opts.server_selection_timeout = Some(Duration::from_secs(15));
+    opts.connect_timeout = Some(Duration::from_secs(15));
 
     let client = Client::with_options(opts).expect("Failed to create MongoDB client");
     let db_name = std::env::var("MONGODB_DB").unwrap_or_else(|_| "snippets_db".into());
